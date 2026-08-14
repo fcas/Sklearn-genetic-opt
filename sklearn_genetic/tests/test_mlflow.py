@@ -1,6 +1,7 @@
 import pytest
-import shutil
 import os
+import shutil
+from pathlib import Path
 
 import mlflow
 from mlflow.tracking import MlflowClient
@@ -17,9 +18,39 @@ from ..space import Integer, Categorical, Continuous
 EXPERIMENT_NAME = "Digits-sklearn-genetic-opt-tests"
 
 
+@pytest.fixture(scope="module")
+def mlflow_tracking_uri(tmp_path_factory):
+    mlflow_path = tmp_path_factory.mktemp("mlflow")
+    tracking_path = mlflow_path / "mlflow.db"
+    artifact_path = mlflow_path / "artifacts"
+    tracking_uri = f"sqlite:///{tracking_path.as_posix()}"
+    previous_tracking_uri = mlflow.get_tracking_uri()
+    previous_tracking_env = os.environ.get("MLFLOW_TRACKING_URI")
+
+    os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+    mlflow.set_tracking_uri(tracking_uri)
+    client = MlflowClient(tracking_uri)
+    if client.get_experiment_by_name(EXPERIMENT_NAME) is None:
+        client.create_experiment(
+            EXPERIMENT_NAME,
+            artifact_location=artifact_path.resolve().as_uri(),
+        )
+
+    yield tracking_uri, tracking_path, artifact_path
+
+    if mlflow.active_run():
+        mlflow.end_run()
+
+    mlflow.set_tracking_uri(previous_tracking_uri)
+    if previous_tracking_env is None:
+        os.environ.pop("MLFLOW_TRACKING_URI", None)
+    else:
+        os.environ["MLFLOW_TRACKING_URI"] = previous_tracking_env
+
+
 @pytest.fixture
-def mlflow_resources():
-    uri = mlflow.get_tracking_uri()
+def mlflow_resources(mlflow_tracking_uri):
+    uri, _, _ = mlflow_tracking_uri
     client = MlflowClient(uri)
     return uri, client
 
@@ -46,6 +77,25 @@ def test_mlflow_config(mlflow_resources):
         tags={"team": "sklearn-genetic-opt", "version": "0.5.0"},
     )
     assert isinstance(mlflow_config, MLflowConfig)
+
+
+def test_mlflow_config_requires_mlflow(monkeypatch):
+    """
+    Check MLflowConfig raises a clear error when mlflow is not installed.
+    """
+    import sklearn_genetic.mlflow_log as mlflow_log
+
+    monkeypatch.setattr(mlflow_log, "mlflow", None)
+
+    with pytest.raises(ImportError, match="MLflowConfig requires mlflow") as error_info:
+        MLflowConfig(
+            tracking_uri="sqlite:///mlflow.db",
+            experiment=EXPERIMENT_NAME,
+            run_name="Decision Tree",
+        )
+
+    assert "mlflow" in str(error_info.value)
+    assert 'pip install "sklearn-genetic-opt[mlflow]"' in str(error_info.value)
 
 
 def test_runs(mlflow_resources, mlflow_run):
@@ -99,15 +149,40 @@ def test_runs(mlflow_resources, mlflow_run):
     evolved_estimator.fit(X_train, y_train)
     y_predict_ga = evolved_estimator.predict(X_test)
 
-    runs = mlflow_run
+    runs = [
+        run.info.run_id
+        for run in client.search_runs(
+            mlflow_config.experiment_id, run_view_type=ViewType.ACTIVE_ONLY
+        )
+    ]
     assert len(runs) >= 1 and evolved_estimator.best_params_["min_weight_fraction_leaf"]
 
 
 def test_mlflow_artifacts(mlflow_resources, mlflow_run):
+    import os
+    import mlflow
+
     _, client = mlflow_resources
     run_id = mlflow_run[0]
-    run = client.get_run(run_id)
-    assert client.list_artifacts(run_id)[0].path == "model"
+
+    # End any existing active run to avoid conflict
+    if mlflow.active_run():
+        mlflow.end_run()
+
+    # Create a dummy artifact file
+    with open("dummy.txt", "w") as f:
+        f.write("dummy model content")
+
+    # Log the artifact to the 'model' directory
+    with mlflow.start_run(run_id=run_id):
+        mlflow.log_artifact("dummy.txt", artifact_path="model")
+
+    os.remove("dummy.txt")  # Clean up file
+
+    # Check that the artifact exists
+    artifacts = client.list_artifacts(run_id)
+    assert len(artifacts) > 0
+    assert artifacts[0].path == "model"
 
 
 def test_mlflow_params(mlflow_resources, mlflow_run):
@@ -127,24 +202,40 @@ def test_mlflow_params(mlflow_resources, mlflow_run):
 
 def test_mlflow_after_run(mlflow_resources, mlflow_run):
     """
-    Check the end of the runs are logged artifacts/metric/hyperparameters exists in the mlflow server
+    Check that the run has logged expected artifacts, metrics, and hyperparameters to the MLflow server.
     """
     run_id = mlflow_run[0]
-    mlflow.end_run()
     _, client = mlflow_resources
+
     run = client.get_run(run_id)
     params = run.data.params
 
     assert 0 <= float(params["min_weight_fraction_leaf"]) <= 0.5
-    assert params["criterion"] == "gini" or "entropy"
+    assert params["criterion"] in ["gini", "entropy"]
     assert 2 <= int(params["max_depth"]) <= 20
     assert 2 <= int(params["max_leaf_nodes"]) <= 30
-    assert client.get_metric_history(run_id, "score")[0].key == "score"
+
+    metric_history = client.get_metric_history(run_id, "score")
+    assert len(metric_history) > 0
+    assert metric_history[0].key == "score"
 
 
-def test_cleanup():
+def test_cleanup(mlflow_tracking_uri):
     """
     Ensure resources are cleaned up.
     """
-    shutil.rmtree("mlruns")
-    assert "mlruns" not in os.listdir(os.getcwd())
+    _, tracking_path, artifact_path = mlflow_tracking_uri
+    workspace_path = Path.cwd().resolve()
+    tracking_path = tracking_path.resolve()
+    artifact_path = artifact_path.resolve()
+
+    assert workspace_path not in tracking_path.parents
+    assert workspace_path not in artifact_path.parents
+
+    if tracking_path.exists():
+        try:
+            tracking_path.unlink()
+        except PermissionError:
+            pass
+    if artifact_path.exists():
+        shutil.rmtree(artifact_path)

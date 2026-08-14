@@ -1,0 +1,21 @@
+{
+  "name": "sklearn-genetic-opt-docs",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "docs:dev": "vitepress dev .",
+    "docs:build": "vitepress build .",
+    "docs:preview": "vitepress preview .",
+    "docs:check-links": "python scripts/check_links.py",
+    "examples:generate": "python scripts/run-python-examples.py",
+    "examples:check": "python scripts/run-python-examples.py --check"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.3"
+  },
+  "overrides": {
+    "vite": "^6.4.3",
+    "esbuild": "^0.25.0"
+  }
+}

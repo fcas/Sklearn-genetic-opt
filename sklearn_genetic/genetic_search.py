@@ -7,9 +7,44 @@ from deap import base, creator, tools
 from sklearn.base import clone
 from sklearn.model_selection import cross_validate
 from sklearn.base import is_classifier, is_regressor, BaseEstimator, MetaEstimatorMixin
+
+try:
+    from sklearn.base import is_outlier_detector
+except ImportError:
+    # Fallback for older sklearn versions
+    def is_outlier_detector(estimator):
+        return hasattr(estimator, "fit_predict") and hasattr(estimator, "decision_function")
+
+
+try:
+    from sklearn.utils.validation import _check_feature_names
+except ImportError:
+
+    def _check_feature_names(estimator, X, *, reset):
+        estimator._check_feature_names(X, reset=reset)
+
+
+def _safe_estimator_check(check, estimator):
+    try:
+        return check(estimator)
+    except AttributeError:
+        return False
+
+
+def _is_classifier(estimator):
+    return _safe_estimator_check(is_classifier, estimator)
+
+
+def _is_regressor(estimator):
+    return _safe_estimator_check(is_regressor, estimator)
+
+
+def _is_outlier_detector(estimator):
+    return _safe_estimator_check(is_outlier_detector, estimator)
+
+
 from sklearn.feature_selection import SelectorMixin
-from sklearn.utils import check_X_y
-from sklearn.utils.validation import check_is_fitted
+from sklearn.utils import check_X_y, check_random_state
 from sklearn.utils.metaestimators import available_if
 from sklearn.feature_selection._from_model import _estimator_has
 from sklearn.metrics import check_scoring
@@ -18,9 +53,9 @@ from sklearn.model_selection._search import BaseSearchCV
 from sklearn.model_selection._split import check_cv
 from sklearn.metrics._scorer import _check_multimetric_scoring
 
-from .parameters import Algorithms, Criteria
-from .space import Space
-from .algorithms import algorithms_factory
+from .parameters import Criteria
+from .space import Categorical, Continuous, Integer, Space
+from ._base import GeneticEstimatorMixin, reset_adapters as _reset_adapters
 from .callbacks.validations import check_callback
 from .schedules.validations import check_adapter
 from .utils.cv_scores import (
@@ -29,9 +64,56 @@ from .utils.cv_scores import (
 )
 from .utils.random import weighted_bool_individual
 from .utils.tools import cxUniform, mutFlipBit
+from .evaluation import (
+    create_fit_stats as _create_fit_stats,
+    evaluate_population as _evaluate_population_batch,
+    logbook_record as _logbook_record,
+    record_fit_stats as _record_fit_stats,
+    validate_error_score as _validate_error_score,
+    validate_parallel_backend as _validate_parallel_backend,
+)
+from .population import (
+    initialize_feature_population,
+    initialize_search_population,
+    validate_population_initializer as _validate_population_initializer,
+)
+from .optimizer_control import (
+    adaptive_tournament_size,
+    validate_optimizer_control as _validate_optimizer_control,
+)
+
+import os
+from .callbacks.model_checkpoint import ModelCheckpoint
+from .config import EvolutionConfig, OptimizationConfig, PopulationConfig, RuntimeConfig
 
 
-class GASearchCV(BaseSearchCV):
+def _seed_global_rngs(random_state):
+    """Seed the global ``random`` and NumPy RNGs from a single ``random_state``.
+
+    A genetic search draws on several sources of randomness — population
+    initialization, DEAP's mutation/crossover operators (which use the global
+    ``random`` module), random immigrants, and NumPy sampling. Seeding them all
+    from one estimator-level ``random_state`` at the start of ``fit`` gives
+    reproducible runs without callers having to seed the global RNGs by hand.
+
+    ``random_state=None`` keeps the default non-deterministic behaviour, matching
+    scikit-learn's convention.
+    """
+    if random_state is None:
+        return
+    seed = int(check_random_state(random_state).randint(0, 2**31 - 1))
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def _resolve_config_value(config, field_name, fallback):
+    if config is None:
+        return fallback
+
+    return getattr(config, field_name, fallback)
+
+
+class GASearchCV(GeneticEstimatorMixin, BaseSearchCV):
     """
     Evolutionary optimization over hyperparameters.
 
@@ -51,10 +133,12 @@ class GASearchCV(BaseSearchCV):
     cv : int, cross-validation generator or an iterable, default=None
         Determines the cross-validation splitting strategy.
         Possible inputs for cv are:
+
         - None, to use the default 5-fold cross validation,
         - int, to specify the number of folds in a `(Stratified)KFold`,
         - CV splitter,
         - An iterable yielding (train, test) splits as arrays of indices.
+
         For int/None inputs, if the estimator is a classifier and ``y`` is
         either binary or multiclass, :class:`StratifiedKFold` is used. In all
         other cases, :class:`KFold` is used. These splitters are instantiated
@@ -70,7 +154,39 @@ class GASearchCV(BaseSearchCV):
         an optimization routine.
 
     population_size : int, default=10
-        Size of the initial population to sample randomly generated individuals.
+        Size of the initial population to sample generated individuals.
+
+    evolution_config : :class:`~sklearn_genetic.config.EvolutionConfig`, default=None
+        Optional grouped configuration for core genetic algorithm controls such
+        as population size, generation count, crossover, mutation, tournament
+        size, elitism, hall-of-fame size, criteria, and algorithm.
+
+    population_config : :class:`~sklearn_genetic.config.PopulationConfig`, default=None
+        Optional grouped configuration for initial population behavior,
+        including ``initializer`` and ``warm_start_configs``.
+
+    runtime_config : :class:`~sklearn_genetic.config.RuntimeConfig`, default=None
+        Optional grouped configuration for parallelism, caching, train-score
+        collection, error handling, and verbose output.
+
+    optimization_config : :class:`~sklearn_genetic.config.OptimizationConfig`, default=None
+        Optional grouped configuration for local refinement, diversity control,
+        adaptive selection, fitness sharing, and robust final selection.
+
+    population_initializer : {'smart', 'random'}, default='smart'
+        Strategy used to generate the initial population. ``'smart'`` combines
+        valid warm-start configurations, valid estimator defaults, Latin
+        hypercube sampling for numeric dimensions, stratified categorical
+        values, and duplicate avoidance. ``'random'`` uses the previous random
+        sampling behavior.
+
+    random_state : int, RandomState instance or None, default=None
+        Controls the randomness of the search. When set, it seeds every
+        stochastic step from a single place at ``fit`` time — population
+        initialization (including the Latin hypercube sampler), mutation,
+        crossover, and random immigrants — so repeated fits give identical
+        results without manually seeding the global ``random`` / ``numpy`` RNGs.
+        ``None`` keeps the default non-deterministic behaviour.
 
     generations : int, default=40
         Number of generations or iterations to run the evolutionary algorithm.
@@ -94,6 +210,7 @@ class GASearchCV(BaseSearchCV):
 
         - a single string;
         - a callable that returns a single value.
+
         If `scoring` represents multiple scores, one can use:
 
         - a list or tuple of unique strings;
@@ -102,10 +219,94 @@ class GASearchCV(BaseSearchCV):
         - a dictionary with metric names as keys and callables a values.
 
     n_jobs : int, default=None
-        Number of jobs to run in parallel. Training the estimator and computing
-        the score are parallelized over the cross-validation splits.
+        Number of jobs to run in parallel. Candidate evaluations in each
+        generation are parallelized when possible; each candidate then runs
+        cross-validation sequentially to avoid nested parallelism.
         ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
         ``-1`` means using all processors.
+
+    parallel_backend : {'auto', 'population', 'cv'}, default='auto'
+        Controls where ``n_jobs`` parallelism is applied during ``fit``.
+        ``'auto'`` and ``'population'`` evaluate unique candidates in each
+        generation in parallel when possible. ``'cv'`` keeps candidate
+        evaluation serial and passes ``n_jobs`` to each candidate's
+        cross-validation call.
+
+    local_search : bool, default=False
+        If ``True``, run a short local refinement phase around the current
+        hall-of-fame individuals after the genetic search finishes.
+
+    local_search_top_k : int, default=1
+        Number of hall-of-fame individuals used as local-search seeds.
+
+    local_search_steps : int, default=1
+        Number of neighbor candidates generated per local-search seed.
+
+    local_search_radius : float, default=0.1
+        Fraction of the search range used to sample local numeric neighbors.
+        For categorical parameters, a different category is sampled.
+
+    diversity_control : bool, default=True
+        If ``True``, monitor diversity and stagnation to boost mutation,
+        replace duplicate candidates, and inject random immigrants.
+
+    adaptive_selection : bool, default=False
+        If ``True``, adapt tournament size from generation telemetry. Selection
+        pressure is reduced when diversity is low or the search is stagnant,
+        and slightly increased when the population is improving with enough
+        diversity.
+
+    selection_pressure_min : int, default=2
+        Minimum tournament size used by adaptive selection.
+
+    selection_pressure_max : int, default=None
+        Maximum tournament size used by adaptive selection. If ``None``, the
+        maximum is one larger than ``tournament_size``.
+
+    offspring_diversity_retries : int, default=0
+        Number of retries used when replacing duplicate or parent-matching
+        offspring with new random candidates.
+
+    diversity_threshold : float, default=0.25
+        Diversity value below which diversity control can trigger.
+
+    diversity_stagnation_generations : int, default=5
+        Number of stagnant generations after which diversity control can
+        inject random immigrants.
+
+    diversity_mutation_boost : float, default=2.0
+        Multiplicative boost applied to mutation probability when diversity
+        control triggers. The boosted value is capped to DEAP's valid range.
+
+    random_immigrants_fraction : float, default=0.1
+        Fraction of offspring replaced by random immigrants when diversity
+        control triggers.
+
+    fitness_sharing : bool, default=False
+        If ``True``, temporarily penalize candidates in crowded niches during
+        selection. Raw cross-validation scores and ``cv_results_`` are not
+        modified.
+
+    sharing_radius : float, default=0.2
+        Normalized distance below which two individuals are considered part of
+        the same niche for fitness sharing.
+
+    sharing_alpha : float, default=1.0
+        Shape parameter that controls how quickly sharing pressure decreases
+        with distance inside ``sharing_radius``.
+
+    final_selection : bool, default=False
+        If ``True``, re-evaluate the top ``final_selection_top_k`` candidates
+        after the GA finishes and select ``best_params_`` from those robust
+        final scores before refitting.
+
+    final_selection_top_k : int, default=3
+        Number of top candidates from the original GA ``cv_results_`` to
+        re-evaluate during final selection.
+
+    final_selection_cv : int, cross-validation splitter or iterable, default=None
+        Cross-validation strategy used for final selection. If ``None``, the
+        same CV splits used during the GA are reused.
 
     verbose : bool, default=True
         If ``True``, shows the metrics on the optimization routine.
@@ -144,15 +345,9 @@ class GASearchCV(BaseSearchCV):
         Controls the number of jobs that get dispatched during parallel
         execution. Reducing this number can be useful to avoid an
         explosion of memory consumption when more jobs get dispatched
-        than CPUs can process. This parameter can be:
-            - None, in which case all the jobs are immediately
-              created and spawned. Use this for lightweight and
-              fast-running jobs, to avoid delays due to on-demand
-              spawning of the jobs
-            - An int, giving the exact number of total jobs that are
-              spawned
-            - A str, giving an expression as a function of n_jobs,
-              as in '2*n_jobs'
+        than CPUs can process. This parameter can be ``None`` to dispatch all
+        jobs immediately, an integer number of total jobs to spawn, or a string
+        expression as a function of ``n_jobs``, such as ``'2*n_jobs'``.
 
     error_score : 'raise' or numeric, default=np.nan
         Value to assign to the score if an error occurs in estimator fitting.
@@ -172,21 +367,20 @@ class GASearchCV(BaseSearchCV):
         Configuration to log metrics and models to mlflow, of None,
         no mlflow logging will be performed
 
+    use_cache: bool, default=True
+        If set to true it will avoid to re-evaluating solutions that have already seen,
+        otherwise it will always evaluate the solutions to get the performance metrics
+
     Attributes
     ----------
 
     logbook : :class:`DEAP.tools.Logbook`
         Contains the logs of every set of hyperparameters fitted with its average scoring metric.
     history : dict
-        Dictionary of the form:
-        {"gen": [],
-        "fitness": [],
-        "fitness_std": [],
-        "fitness_max": [],
-        "fitness_min": []}
-
-         *gen* returns the index of the evaluated generations.
-         Each entry on the others lists, represent the average metric in each generation.
+        Dictionary with one list per generation. It includes ``gen``,
+        ``fitness``, ``fitness_std``, ``fitness_best``, ``fitness_max``, ``fitness_min``,
+        population diversity fields, stagnation fields, optimizer-control
+        telemetry, and local-refinement telemetry.
 
     cv_results_ : dict of numpy (masked) ndarrays
         A dict with keys as column headers and values as columns, that can be
@@ -211,6 +405,11 @@ class GASearchCV(BaseSearchCV):
     refit_time_ : float
         Seconds used for refitting the best model on the whole dataset.
         This is present only if ``refit`` is not False.
+    fit_stats_ : dict
+        Counters collected during the last ``fit`` call. Includes evaluated
+        candidates, unique candidates, cross-validation calls, cache hits,
+        duplicate candidates, skipped invalid candidates, and population-level
+        parallel/serial batch counts.
     """
 
     def __init__(
@@ -221,8 +420,8 @@ class GASearchCV(BaseSearchCV):
         scoring=None,
         population_size=50,
         generations=80,
-        crossover_probability=0.2,
-        mutation_probability=0.8,
+        crossover_probability=0.8,
+        mutation_probability=0.1,
         tournament_size=3,
         elitism=True,
         verbose=True,
@@ -230,12 +429,139 @@ class GASearchCV(BaseSearchCV):
         criteria="max",
         algorithm="eaMuPlusLambda",
         refit=True,
-        n_jobs=1,
+        n_jobs=None,
         pre_dispatch="2*n_jobs",
         error_score=np.nan,
         return_train_score=False,
         log_config=None,
+        use_cache=True,
+        warm_start_configs=None,
+        evolution_config=None,
+        population_config=None,
+        runtime_config=None,
+        optimization_config=None,
+        parallel_backend="auto",
+        population_initializer="smart",
+        random_state=None,
+        local_search=False,
+        local_search_top_k=1,
+        local_search_steps=1,
+        local_search_radius=0.1,
+        diversity_control=True,
+        diversity_threshold=0.25,
+        diversity_stagnation_generations=5,
+        diversity_mutation_boost=2.0,
+        random_immigrants_fraction=0.1,
+        adaptive_selection=False,
+        selection_pressure_min=2,
+        selection_pressure_max=None,
+        offspring_diversity_retries=0,
+        fitness_sharing=False,
+        sharing_radius=0.2,
+        sharing_alpha=1.0,
+        final_selection=False,
+        final_selection_top_k=3,
+        final_selection_cv=None,
     ):
+        legacy_warm_start_configs = warm_start_configs
+
+        population_size = _resolve_config_value(
+            evolution_config, "population_size", population_size
+        )
+        generations = _resolve_config_value(evolution_config, "generations", generations)
+        crossover_probability = _resolve_config_value(
+            evolution_config, "crossover_probability", crossover_probability
+        )
+        mutation_probability = _resolve_config_value(
+            evolution_config, "mutation_probability", mutation_probability
+        )
+        tournament_size = _resolve_config_value(
+            evolution_config, "tournament_size", tournament_size
+        )
+        elitism = _resolve_config_value(evolution_config, "elitism", elitism)
+        keep_top_k = _resolve_config_value(evolution_config, "keep_top_k", keep_top_k)
+        criteria = _resolve_config_value(evolution_config, "criteria", criteria)
+        algorithm = _resolve_config_value(evolution_config, "algorithm", algorithm)
+
+        population_initializer = _resolve_config_value(
+            population_config, "initializer", population_initializer
+        )
+        warm_start_configs = _resolve_config_value(
+            population_config, "warm_start_configs", warm_start_configs
+        )
+
+        n_jobs = _resolve_config_value(runtime_config, "n_jobs", n_jobs)
+        pre_dispatch = _resolve_config_value(runtime_config, "pre_dispatch", pre_dispatch)
+        error_score = _resolve_config_value(runtime_config, "error_score", error_score)
+        return_train_score = _resolve_config_value(
+            runtime_config, "return_train_score", return_train_score
+        )
+        use_cache = _resolve_config_value(runtime_config, "use_cache", use_cache)
+        parallel_backend = _resolve_config_value(
+            runtime_config, "parallel_backend", parallel_backend
+        )
+        verbose = _resolve_config_value(runtime_config, "verbose", verbose)
+
+        local_search = _resolve_config_value(optimization_config, "local_search", local_search)
+        local_search_top_k = _resolve_config_value(
+            optimization_config, "local_search_top_k", local_search_top_k
+        )
+        local_search_steps = _resolve_config_value(
+            optimization_config, "local_search_steps", local_search_steps
+        )
+        local_search_radius = _resolve_config_value(
+            optimization_config, "local_search_radius", local_search_radius
+        )
+        diversity_control = _resolve_config_value(
+            optimization_config, "diversity_control", diversity_control
+        )
+        diversity_threshold = _resolve_config_value(
+            optimization_config, "diversity_threshold", diversity_threshold
+        )
+        diversity_stagnation_generations = _resolve_config_value(
+            optimization_config,
+            "diversity_stagnation_generations",
+            diversity_stagnation_generations,
+        )
+        diversity_mutation_boost = _resolve_config_value(
+            optimization_config, "diversity_mutation_boost", diversity_mutation_boost
+        )
+        random_immigrants_fraction = _resolve_config_value(
+            optimization_config, "random_immigrants_fraction", random_immigrants_fraction
+        )
+        adaptive_selection = _resolve_config_value(
+            optimization_config, "adaptive_selection", adaptive_selection
+        )
+        selection_pressure_min = _resolve_config_value(
+            optimization_config, "selection_pressure_min", selection_pressure_min
+        )
+        selection_pressure_max = _resolve_config_value(
+            optimization_config, "selection_pressure_max", selection_pressure_max
+        )
+        offspring_diversity_retries = _resolve_config_value(
+            optimization_config, "offspring_diversity_retries", offspring_diversity_retries
+        )
+        fitness_sharing = _resolve_config_value(
+            optimization_config, "fitness_sharing", fitness_sharing
+        )
+        sharing_radius = _resolve_config_value(
+            optimization_config, "sharing_radius", sharing_radius
+        )
+        sharing_alpha = _resolve_config_value(optimization_config, "sharing_alpha", sharing_alpha)
+        final_selection = _resolve_config_value(
+            optimization_config, "final_selection", final_selection
+        )
+        final_selection_top_k = _resolve_config_value(
+            optimization_config, "final_selection_top_k", final_selection_top_k
+        )
+        final_selection_cv = _resolve_config_value(
+            optimization_config, "final_selection_cv", final_selection_cv
+        )
+
+        self.evolution_config = evolution_config
+        self.population_config = population_config
+        self.runtime_config = runtime_config
+        self.optimization_config = optimization_config
         self.estimator = estimator
         self.cv = cv
         self.scoring = scoring
@@ -259,10 +585,62 @@ class GASearchCV(BaseSearchCV):
         self.return_train_score = return_train_score
         # self.creator = creator
         self.log_config = log_config
+        self.use_cache = use_cache
+        self.fitness_cache = {}
+        self.warm_start_configs = legacy_warm_start_configs
+        self._warm_start_configs = warm_start_configs
+        self.parallel_backend = parallel_backend
+        self.population_initializer = population_initializer
+        self.random_state = random_state
+        self.local_search = local_search
+        self.local_search_top_k = local_search_top_k
+        self.local_search_steps = local_search_steps
+        self.local_search_radius = local_search_radius
+        self.diversity_control = diversity_control
+        self.diversity_threshold = diversity_threshold
+        self.diversity_stagnation_generations = diversity_stagnation_generations
+        self.diversity_mutation_boost = diversity_mutation_boost
+        self.random_immigrants_fraction = random_immigrants_fraction
+        self.adaptive_selection = adaptive_selection
+        self.selection_pressure_min = selection_pressure_min
+        self.selection_pressure_max = selection_pressure_max
+        self.offspring_diversity_retries = offspring_diversity_retries
+        self.fitness_sharing = fitness_sharing
+        self.sharing_radius = sharing_radius
+        self.sharing_alpha = sharing_alpha
+        self.final_selection = final_selection
+        self.final_selection_top_k = final_selection_top_k
+        self.final_selection_cv = final_selection_cv
+
+        _validate_parallel_backend(self.parallel_backend)
+        _validate_error_score(self.error_score)
+        _validate_population_initializer(self.population_initializer)
+        if self.final_selection_top_k < 1:
+            raise ValueError("final_selection_top_k must be greater than or equal to 1")
+        _validate_optimizer_control(
+            self.local_search_top_k,
+            self.local_search_steps,
+            self.local_search_radius,
+            self.diversity_threshold,
+            self.diversity_stagnation_generations,
+            self.diversity_mutation_boost,
+            self.random_immigrants_fraction,
+            self.sharing_radius,
+            self.sharing_alpha,
+            self.selection_pressure_min,
+            self.selection_pressure_max,
+            self.offspring_diversity_retries,
+        )
 
         # Check that the estimator is compatible with scikit-learn
-        if not is_classifier(self.estimator) and not is_regressor(self.estimator):
-            raise ValueError(f"{self.estimator} is not a valid Sklearn classifier or regressor")
+        if not (
+            _is_classifier(self.estimator)
+            or _is_regressor(self.estimator)
+            or _is_outlier_detector(self.estimator)
+        ):
+            raise ValueError(
+                f"{self.estimator} is not a valid Sklearn classifier, regressor, or outlier detector"
+            )
 
         if criteria not in Criteria.list():
             raise ValueError(f"Criteria must be one of {Criteria.list()}, got {criteria} instead")
@@ -299,7 +677,7 @@ class GASearchCV(BaseSearchCV):
         """
         self.toolbox = base.Toolbox()
 
-        creator.create("FitnessMax", base.Fitness, weights=[self.criteria_sign])
+        creator.create("FitnessMax", base.Fitness, weights=(self.criteria_sign,))
         creator.create("Individual", list, fitness=creator.FitnessMax)
 
         attributes = []
@@ -321,34 +699,90 @@ class GASearchCV(BaseSearchCV):
 
         self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
 
-        if len(self.space) == 1:
+        if len(self.space) == 1 and hasattr(list(self.space.param_grid.values())[0], "lower"):
             sampler = list(self.space.param_grid.values())[0]
             lower, upper = sampler.lower, sampler.upper
 
             self.toolbox.register(
-                "mate", tools.cxSimulatedBinaryBounded, low=lower, up=upper, eta=10
+                "mate_raw", tools.cxSimulatedBinaryBounded, low=lower, up=upper, eta=10
             )
         else:
-            self.toolbox.register("mate", tools.cxTwoPoint)
+            self.toolbox.register("mate_raw", tools.cxUniform, indpb=0.5)
 
+        self.toolbox.register("mate", self.mate)
         self.toolbox.register("mutate", self.mutate)
-        if self.elitism:
-            self.toolbox.register("select", tools.selTournament, tournsize=self.tournament_size)
-        else:
-            self.toolbox.register("select", tools.selRoulette)
+        self.toolbox.register("select", self.select)
 
         self.toolbox.register("evaluate", self.evaluate)
+        self.toolbox.register("evaluate_population", self.evaluate_population)
 
-        self._pop = self.toolbox.population(n=self.population_size)
+        self._pop = self._initialize_population()
         self._hof = tools.HallOfFame(self.keep_top_k)
 
-        self._stats = tools.Statistics(ind_fitness_values)
-        self._stats.register("fitness", np.mean)
-        self._stats.register("fitness_std", np.std)
-        self._stats.register("fitness_max", np.max)
-        self._stats.register("fitness_min", np.min)
+        self._stats = tools.Statistics(lambda ind: ind.fitness.values)
+        self._stats.register("fitness", np.mean, axis=0)
+        self._stats.register("fitness_std", np.std, axis=0)
+        self._stats.register("fitness_max", np.max, axis=0)
+        self._stats.register("fitness_min", np.min, axis=0)
 
         self.logbook = tools.Logbook()
+
+    def _initialize_population(self):
+        """
+        Initialize the population, using warm-start configurations if provided.
+        """
+        population = initialize_search_population(self, self.toolbox, creator.Individual)
+        for individual in population:
+            self._repair_individual(individual)
+        return population
+
+    def select(self, population, k):
+        if not self.elitism:
+            self._selection_pressure_ = None
+            return tools.selRoulette(population, k)
+
+        tournament_size = adaptive_tournament_size(
+            self,
+            getattr(self, "_last_generation_record", None),
+            len(population),
+        )
+        self._selection_pressure_ = tournament_size
+        return tools.selTournament(population, k, tournsize=tournament_size)
+
+    def _repair_value(self, dimension, value):
+        if isinstance(dimension, Integer):
+            if value is None:
+                return dimension.sample()
+
+            repaired = int(round(float(value)))
+            return int(np.clip(repaired, dimension.lower, dimension.upper))
+
+        if isinstance(dimension, Continuous):
+            if value is None:
+                return dimension.sample()
+
+            repaired = float(value)
+            return float(np.clip(repaired, dimension.lower, dimension.upper))
+
+        if isinstance(dimension, Categorical):
+            return value if value in dimension.choices else dimension.sample()
+
+        return value
+
+    def _repair_individual(self, individual):
+        if not hasattr(self, "space"):
+            return individual
+
+        for index, parameter in enumerate(self.space.parameters):
+            individual[index] = self._repair_value(self.space[parameter], individual[index])
+
+        return individual
+
+    def mate(self, individual_1, individual_2):
+        offspring_1, offspring_2 = self.toolbox.mate_raw(individual_1, individual_2)
+        self._repair_individual(offspring_1)
+        self._repair_individual(offspring_2)
+        return offspring_1, offspring_2
 
     def mutate(self, individual):
         """
@@ -371,22 +805,23 @@ class GASearchCV(BaseSearchCV):
         # Using the defined distribution from the para_grid value
         # Make a random sample of the parameter
         individual[gen] = parameter.sample()
+        self._repair_individual(individual)
 
         return [individual]
 
-    def evaluate(self, individual):
-        """
-        Compute the cross-validation scores and record the logbook and mlflow (if specified)
-        Parameters
-        ----------
-        individual: Individual object
-            The individual (set of hyperparameters) that is being evaluated
-        Returns
-        -------
-            The fitness value of the estimator candidate, corresponding to the cv-score
+    def _individual_key(self, individual):
+        current_generation_params = {
+            key: individual[n] for n, key in enumerate(self.space.parameters)
+        }
+        return tuple(sorted(current_generation_params.items()))
 
-        """
+    def evaluate_population(self, individuals):
+        for individual in individuals:
+            self._repair_individual(individual)
+        return _evaluate_population_batch(self, individuals, "current_generation_params")
 
+    def _evaluate_individual(self, individual, n_jobs=None):
+        self._repair_individual(individual)
         # Dictionary representation of the individual with key-> hyperparameter name, value -> value
         current_generation_params = {
             key: individual[n] for n, key in enumerate(self.space.parameters)
@@ -395,17 +830,18 @@ class GASearchCV(BaseSearchCV):
         local_estimator = clone(self.estimator)
         local_estimator.set_params(**current_generation_params)
 
-        # Compute the cv-metrics
+        # standard cross_validate for all estimator types is used
         cv_results = cross_validate(
             local_estimator,
             self.X_,
             self.y_,
-            cv=self.cv,
-            scoring=self.scoring,
-            n_jobs=self.n_jobs,
+            cv=self._cv_splits,
+            scoring=self.scorer_,
+            n_jobs=n_jobs,
             pre_dispatch=self.pre_dispatch,
             error_score=self.error_score,
             return_train_score=self.return_train_score,
+            params=getattr(self, "_fit_params", None) or None,
         )
 
         cv_scores = cv_results[f"test_{self.refit_metric}"]
@@ -431,15 +867,183 @@ class GASearchCV(BaseSearchCV):
             if self.return_train_score:
                 current_generation_params[f"train_{metric}"] = cv_results[f"train_{metric}"]
 
-        index = len(self.logbook.chapters["parameters"])
-        current_generation_params = {"index": index, **current_generation_params}
+        fitness_result = (score,)
 
-        # Log the hyperparameters and the cv-score
-        self.logbook.record(parameters=current_generation_params)
+        return fitness_result, current_generation_params, True, False
 
-        return [score]
+    def evaluate(self, individual):
+        """
+        Compute the cross-validation scores and record the logbook and mlflow (if specified)
+        Parameters
+        ----------
+        individual: Individual object
+            The individual (set of hyperparameters) that is being evaluated
+        Returns
+        -------
+            The fitness value of the estimator candidate, corresponding to the cv-score
 
-    def fit(self, X, y, callbacks=None):
+        """
+
+        # Convert hyperparameters to a tuple to use as a key in the cache
+        self._repair_individual(individual)
+        individual_key = self._individual_key(individual)
+
+        # Check if the individual has already been evaluated
+        if individual_key in self.fitness_cache and self.use_cache:
+            # Retrieve cached result
+            cached_result = self.fitness_cache[individual_key]
+            # Ensure the logbook is updated even if the individual is cached
+            self.logbook.record(parameters=cached_result["current_generation_params"])
+            _record_fit_stats(self, evaluated=1, cache_hits=1)
+            return cached_result["fitness"]
+
+        candidate_n_jobs = self.n_jobs if self.parallel_backend == "cv" else 1
+        (
+            fitness_result,
+            current_generation_params,
+            used_cv,
+            skipped_invalid,
+        ) = self._evaluate_individual(
+            individual,
+            n_jobs=candidate_n_jobs,
+        )
+        current_generation_params = _logbook_record(
+            self.logbook,
+            "parameters",
+            current_generation_params,
+        )
+
+        if self.use_cache:
+            # Store the fitness result and the current generation parameters in the cache
+            self.fitness_cache[individual_key] = {
+                "fitness": fitness_result,
+                "current_generation_params": current_generation_params,
+            }
+
+        _record_fit_stats(
+            self,
+            evaluated=1,
+            unique=1,
+            cv_calls=int(used_cv),
+            skipped=int(skipped_invalid),
+        )
+
+        return fitness_result
+
+    def _candidate_params_from_index(self, index):
+        return self.cv_results_["params"][index]
+
+    def _top_candidate_indices(self):
+        ranks = np.asarray(self.cv_results_[f"rank_test_{self.refit_metric}"])
+        return list(np.argsort(ranks)[: self.final_selection_top_k])
+
+    def _final_selection_splits(self):
+        if self.final_selection_cv is None:
+            return self._cv_splits
+
+        cv = check_cv(self.final_selection_cv, self.y_, classifier=_is_classifier(self.estimator))
+        groups = getattr(self, "groups_", None)
+        if groups is None:
+            return list(cv.split(self.X_, self.y_))
+        return list(cv.split(self.X_, self.y_, groups=groups))
+
+    def _score_final_candidate(self, params, cv_splits):
+        local_estimator = clone(self.estimator)
+        local_estimator.set_params(**params)
+
+        cv_results = cross_validate(
+            local_estimator,
+            self.X_,
+            self.y_,
+            cv=cv_splits,
+            scoring=self.scorer_,
+            n_jobs=self.n_jobs,
+            pre_dispatch=self.pre_dispatch,
+            error_score=self.error_score,
+            return_train_score=False,
+            params=getattr(self, "_fit_params", None) or None,
+        )
+        cv_scores = cv_results[f"test_{self.refit_metric}"]
+        return float(np.mean(cv_scores)), cv_scores
+
+    def _select_final_candidate(self):
+        original_best_index = int(self.cv_results_[f"rank_test_{self.refit_metric}"].argmin())
+        original_best_score = float(
+            self.cv_results_[f"mean_test_{self.refit_metric}"][original_best_index]
+        )
+        original_best_params = self._candidate_params_from_index(original_best_index)
+
+        self.final_selection_results_ = {
+            "enabled": bool(self.final_selection),
+            "top_k": 1,
+            "cv": self.final_selection_cv,
+            "original_best_index": original_best_index,
+            "original_best_score": original_best_score,
+            "original_best_params": original_best_params,
+            "selected_index": original_best_index,
+            "selected_score": original_best_score,
+            "selected_params": original_best_params,
+            "changed": False,
+            "candidates": [],
+            "time_seconds": 0.0,
+        }
+
+        if not self.final_selection:
+            return original_best_index, original_best_score, original_best_params
+
+        started_at = time.time()
+        cv_splits = self._final_selection_splits()
+        candidate_results = []
+        seen_params = set()
+
+        for index in self._top_candidate_indices():
+            params = self._candidate_params_from_index(index)
+            params_key = tuple(sorted(params.items()))
+            if params_key in seen_params:
+                continue
+            seen_params.add(params_key)
+
+            score, cv_scores = self._score_final_candidate(params, cv_splits)
+            candidate_results.append(
+                {
+                    "index": int(index),
+                    "original_score": float(
+                        self.cv_results_[f"mean_test_{self.refit_metric}"][index]
+                    ),
+                    "score": score,
+                    "cv_scores": cv_scores.tolist(),
+                    "params": params,
+                }
+            )
+
+        if candidate_results:
+            if self.criteria == "min":
+                selected = min(candidate_results, key=lambda item: item["score"])
+            else:
+                selected = max(candidate_results, key=lambda item: item["score"])
+            selected_index = selected["index"]
+            selected_score = selected["score"]
+            selected_params = selected["params"]
+        else:  # pragma: no cover
+            selected_index = original_best_index
+            selected_score = original_best_score
+            selected_params = original_best_params
+
+        self.final_selection_results_.update(
+            {
+                "top_k": self.final_selection_top_k,
+                "selected_index": selected_index,
+                "selected_score": selected_score,
+                "selected_params": selected_params,
+                "changed": selected_index != original_best_index,
+                "candidates": candidate_results,
+                "time_seconds": time.time() - started_at,
+            }
+        )
+
+        return selected_index, selected_score, selected_params
+
+    def fit(self, X, y=None, callbacks=None, groups=None, **fit_params):
         """
         Main method of GASearchCV, starts the optimization
         procedure with the hyperparameters of the given estimator
@@ -452,28 +1056,122 @@ class GASearchCV(BaseSearchCV):
         y : array-like of shape (n_samples,) or (n_samples, n_outputs), \
             default=None
             The target variable to try to predict in the case of
-            supervised learning.
+            supervised learning. For outlier detection, y can be None.
         callbacks: list or callable
             One or a list of the callbacks methods available in
             :class:`~sklearn_genetic.callbacks`.
             The callback is evaluated after fitting the estimators from the generation 1.
+        groups : array-like of shape (n_samples,), default=None
+            Group labels for the samples used while splitting the dataset into
+            train/test sets. Only used in conjunction with a "Group" cv
+            instance such as :class:`~sklearn.model_selection.GroupKFold`.
+        **fit_params : dict of str -> object
+            Parameters passed to the ``fit`` method of the underlying
+            estimator (e.g. ``sample_weight``). They are forwarded to every
+            candidate cross-validation, to final-selection scoring, and to
+            the final refit. Sample-aligned parameters are sliced per CV
+            fold by scikit-learn.
         """
 
         self.X_ = X
         self.y_ = y
+        self.groups_ = groups
+        self._fit_params = fit_params
         self._n_iterations = self.generations + 1
         self.refit_metric = "score"
         self.multimetric_ = False
 
+        # added a handle outlier detection jussst in case where y might be None
+        if _is_outlier_detector(self.estimator) and y is None:
+            # and for unsupervised outlier detection, it will create dummy y for cv compatibility :)
+            self.y_ = np.zeros(X.shape[0])
+
         # Make sure the callbacks are valid
         self.callbacks = check_callback(callbacks)
+
+        checkpoint_loaded = False
+        restored_logbook = None
+        restored_fit_stats = None
+        restored_generation_log = None
+        restored_adapter_state = None
+
+        # Load state if a checkpoint exists
+        for callback in self.callbacks:
+            if isinstance(callback, ModelCheckpoint):
+                if os.path.exists(callback.checkpoint_path):
+                    checkpoint_data = callback.load()
+                    if checkpoint_data:
+                        self.__dict__.update(checkpoint_data["estimator_state"])  # noqa
+                        # Restore the fitness cache so already-evaluated
+                        # candidates are reused instead of re-evaluated. Older
+                        # checkpoints have no ``runtime_state``, so guard with
+                        # .get() for backward compatibility.
+                        runtime_state = checkpoint_data.get("runtime_state") or {}
+                        cached = runtime_state.get("fitness_cache")
+                        if cached is not None:
+                            self.fitness_cache = cached
+                        restored_fit_stats = runtime_state.get("fit_stats_")
+                        # ``checkpoint_data["logbook"]`` is the per-*generation*
+                        # summary log (see ModelCheckpoint.on_step), not
+                        # ``self.logbook`` -- restoring it onto ``self.logbook``
+                        # would silently break ``cv_results_``/``history``.
+                        # ``_register()`` below also unconditionally creates a
+                        # fresh ``self.logbook``, so stash the real one and put
+                        # it back afterwards (see comment near the
+                        # ``_register()`` call).
+                        restored_logbook = runtime_state.get("candidate_logbook")
+                        # The per-generation summary log saved under the
+                        # legacy ``"logbook"`` key is exactly what generation
+                        # numbering needs to continue from -- see
+                        # ``_seed_logbook`` in ``algorithms.py``.
+                        restored_generation_log = checkpoint_data.get("logbook")
+                        restored_adapter_state = runtime_state.get("adapter_state")
+                        checkpoint_loaded = True
+                    break
+
+        # Seed after the checkpoint (if any) is loaded: ``self.__dict__.update()``
+        # above may have just replaced ``self.random_state`` with the value from
+        # a resumed run's checkpoint, and seeding before that point would use the
+        # pre-resume value instead (see #299).
+        _seed_global_rngs(self.random_state)
+
+        if checkpoint_loaded and restored_adapter_state is not None:
+            # Restore the crossover/mutation adapter step counters so the
+            # schedule continues from where the previous run left off
+            # instead of restarting from step 0 (see adapter checkpoint).
+            self.crossover_adapter.load_state_dict(restored_adapter_state["crossover"])
+            self.mutation_adapter.load_state_dict(restored_adapter_state["mutation"])
+        elif not checkpoint_loaded:
+            _reset_adapters(self)
+
+        # Preserve cumulative counters across a resume instead of zeroing them,
+        # so e.g. ``cache_hits``/``evaluated_candidates`` reflect the whole run.
+        self.fit_stats_ = (
+            restored_fit_stats if restored_fit_stats is not None else _create_fit_stats()
+        )
+        self._resume_generation_log = restored_generation_log
 
         if callable(self.scoring):
             self.scorer_ = self.scoring
             self.metrics_list = [self.refit_metric]
         elif self.scoring is None or isinstance(self.scoring, str):
-            self.scorer_ = check_scoring(self.estimator, self.scoring)
-            self.metrics_list = [self.refit_metric]
+            # it will handle outlier detectors that don't have a score method
+            if _is_outlier_detector(self.estimator) and self.scoring is None:
+                # this function creates a default scorer for outlier detection
+                def default_outlier_scorer(estimator, X, y=None):
+                    if hasattr(estimator, "score_samples"):
+                        return np.mean(estimator.score_samples(X))
+                    elif hasattr(estimator, "decision_function"):
+                        return np.mean(estimator.decision_function(X))
+                    else:
+                        predictions = estimator.fit_predict(X)
+                        return np.mean(predictions == 1)
+
+                self.scorer_ = default_outlier_scorer
+                self.metrics_list = [self.refit_metric]
+            else:
+                self.scorer_ = check_scoring(self.estimator, self.scoring)
+                self.metrics_list = [self.refit_metric]
         else:
             self.scorer_ = _check_multimetric_scoring(self.estimator, self.scoring)
             self._check_refit_for_multimetric(self.scorer_)
@@ -481,12 +1179,31 @@ class GASearchCV(BaseSearchCV):
             self.metrics_list = self.scorer_.keys()
             self.multimetric_ = True
 
+        # Only pass groups when given, so custom splitters written without a
+        # groups argument keep working when no groups are used.
+        cv_groups_kwargs = {} if self.groups_ is None else {"groups": self.groups_}
+
         # Check cv and get the n_splits
-        cv_orig = check_cv(self.cv, y, classifier=is_classifier(self.estimator))
-        self.n_splits_ = cv_orig.get_n_splits(X, y)
+        if _is_outlier_detector(self.estimator):
+            # For outlier detectors, better to use KFold instead of classifier-based CV
+            from sklearn.model_selection import KFold
+
+            cv_orig = KFold(n_splits=self.cv if isinstance(self.cv, int) else 5)
+            self.n_splits_ = cv_orig.get_n_splits(X, self.y_)
+        else:
+            cv_orig = check_cv(self.cv, self.y_, classifier=_is_classifier(self.estimator))
+            self.n_splits_ = cv_orig.get_n_splits(X, self.y_, **cv_groups_kwargs)
+        self._cv_splits = list(cv_orig.split(self.X_, self.y_, **cv_groups_kwargs))
 
         # Set the DEAPs necessary methods
         self._register()
+        # ``_register()`` always creates a fresh, empty ``self.logbook`` (it
+        # also builds the toolbox/population/hof/stats, which are ``deap``
+        # objects that cannot be checkpointed and are intentionally rebuilt on
+        # every ``fit`` call). Put the restored per-candidate logbook back so
+        # resumed candidates are not dropped from ``cv_results_``/``history``.
+        if restored_logbook is not None:
+            self.logbook = restored_logbook
 
         # Optimization routine from the selected evolutionary algorithm
         pop, log, n_gen = self._select_algorithm(pop=self._pop, stats=self._stats, hof=self._hof)
@@ -505,15 +1222,31 @@ class GASearchCV(BaseSearchCV):
             "gen": log.select("gen"),
             "fitness": log.select("fitness"),
             "fitness_std": log.select("fitness_std"),
+            "fitness_best": log.select("fitness_best"),
             "fitness_max": log.select("fitness_max"),
             "fitness_min": log.select("fitness_min"),
+            "population_size": log.select("population_size"),
+            "unique_individuals": log.select("unique_individuals"),
+            "unique_individual_ratio": log.select("unique_individual_ratio"),
+            "genotype_diversity": log.select("genotype_diversity"),
+            "fitness_improvement": log.select("fitness_improvement"),
+            "fitness_improved": log.select("fitness_improved"),
+            "stagnation_generations": log.select("stagnation_generations"),
+            "best_generation": log.select("best_generation"),
+            "mutation_probability": log.select("mutation_probability"),
+            "selection_pressure": log.select("selection_pressure"),
+            "diversity_control_triggered": log.select("diversity_control_triggered"),
+            "random_immigrants": log.select("random_immigrants"),
+            "duplicate_replacements": log.select("duplicate_replacements"),
+            "local_refinements": log.select("local_refinements"),
+            "fitness_sharing_applied": log.select("fitness_sharing_applied"),
+            "mean_niche_count": log.select("mean_niche_count"),
+            "max_niche_count": log.select("max_niche_count"),
         }
 
         # Imitate the logic of scikit-learn refit parameter
         if self.refit:
-            self.best_index_ = self.cv_results_[f"rank_test_{self.refit_metric}"].argmin()
-            self.best_score_ = self.cv_results_[f"mean_test_{self.refit_metric}"][self.best_index_]
-            self.best_params_ = self.cv_results_["params"][self.best_index_]
+            self.best_index_, self.best_score_, self.best_params_ = self._select_final_candidate()
 
             self.estimator.set_params(**self.best_params_)
 
@@ -521,6 +1254,7 @@ class GASearchCV(BaseSearchCV):
             self.estimator.fit(
                 self.X_,
                 self.y_,
+                **getattr(self, "_fit_params", {}),
             )
             refit_end_time = time.time()
             self.refit_time_ = refit_end_time - refit_start_time
@@ -545,121 +1279,8 @@ class GASearchCV(BaseSearchCV):
 
         return self
 
-    def _select_algorithm(self, pop, stats, hof):
-        """
-        It selects the algorithm to run from the sklearn_genetic.algorithms module
-        based in the parameter self.algorithm.
 
-        Parameters
-        ----------
-        pop: pop object from DEAP
-        stats: stats object from DEAP
-        hof: hof object from DEAP
-
-        Returns
-        -------
-        pop: pop object
-            The last evaluated population
-        log: Logbook object
-            It contains the calculated metrics {'fitness', 'fitness_std', 'fitness_max', 'fitness_min'}
-            the number of generations and the number of evaluated individuals per generation
-        n_gen: int
-            The number of generations that the evolutionary algorithm ran
-        """
-
-        selected_algorithm = algorithms_factory.get(self.algorithm, None)
-        if selected_algorithm:
-            pop, log, gen = selected_algorithm(
-                pop,
-                self.toolbox,
-                mu=self.population_size,
-                lambda_=2 * self.population_size,
-                cxpb=self.crossover_adapter,
-                stats=stats,
-                mutpb=self.mutation_adapter,
-                ngen=self.generations,
-                halloffame=hof,
-                callbacks=self.callbacks,
-                verbose=self.verbose,
-                estimator=self,
-            )
-
-        else:
-            raise ValueError(
-                f"The algorithm {self.algorithm} is not supported, "
-                f"please select one from {Algorithms.list()}"
-            )
-
-        return pop, log, gen
-
-    def _run_search(self, evaluate_candidates):
-        pass  # noqa
-
-    @property
-    def _fitted(self):
-        try:
-            check_is_fitted(self.estimator)
-            is_fitted = True
-        except Exception as e:
-            is_fitted = False
-
-        has_history = hasattr(self, "history") and bool(self.history)
-        return all([is_fitted, has_history, self.refit])
-
-    def __getitem__(self, index):
-        """
-
-        Parameters
-        ----------
-        index: slice required to get
-
-        Returns
-        -------
-        Best solution of the iteration corresponding to the index number
-        """
-        if not self._fitted:
-            raise NotFittedError(
-                f"This GASearchCV instance is not fitted yet "
-                f"or used refit=False. Call 'fit' with appropriate "
-                f"arguments before using this estimator."
-            )
-
-        return {
-            "gen": self.history["gen"][index],
-            "fitness": self.history["fitness"][index],
-            "fitness_std": self.history["fitness_std"][index],
-            "fitness_max": self.history["fitness_max"][index],
-            "fitness_min": self.history["fitness_min"][index],
-        }
-
-    def __iter__(self):
-        self.n = 0
-        return self
-
-    def __next__(self):
-        """
-        Returns
-        -------
-        Iteration over the statistics found in each generation
-        """
-        if self.n < self._n_iterations + 1:
-            result = self.__getitem__(self.n)
-            self.n += 1
-            return result
-        else:
-            raise StopIteration  # pragma: no cover
-
-    def __len__(self):
-        """
-        Returns
-        -------
-        Number of generations fitted if .fit method has been called,
-        self.generations otherwise
-        """
-        return self._n_iterations
-
-
-class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
+class GAFeatureSelectionCV(GeneticEstimatorMixin, MetaEstimatorMixin, SelectorMixin, BaseEstimator):
     """
     Evolutionary optimization for feature selection.
 
@@ -679,17 +1300,103 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
     cv : int, cross-validation generator or an iterable, default=None
         Determines the cross-validation splitting strategy.
         Possible inputs for cv are:
+
         - None, to use the default 5-fold cross validation,
         - int, to specify the number of folds in a `(Stratified)KFold`,
         - CV splitter,
         - An iterable yielding (train, test) splits as arrays of indices.
+
         For int/None inputs, if the estimator is a classifier and ``y`` is
         either binary or multiclass, :class:`StratifiedKFold` is used. In all
         other cases, :class:`KFold` is used. These splitters are instantiated
         with `shuffle=False` so the splits will be the same across calls.
 
     population_size : int, default=10
-        Size of the initial population to sample randomly generated individuals.
+        Size of the initial population to sample generated individuals.
+
+    evolution_config : :class:`~sklearn_genetic.config.EvolutionConfig`, default=None
+        Optional grouped configuration for core genetic algorithm controls such
+        as population size, generation count, crossover, mutation, tournament
+        size, elitism, hall-of-fame size, criteria, and algorithm.
+
+    population_config : :class:`~sklearn_genetic.config.PopulationConfig`, default=None
+        Optional grouped configuration for the initial feature-mask population.
+
+    runtime_config : :class:`~sklearn_genetic.config.RuntimeConfig`, default=None
+        Optional grouped configuration for parallelism, caching, train-score
+        collection, error handling, and verbose output.
+
+    optimization_config : :class:`~sklearn_genetic.config.OptimizationConfig`, default=None
+        Optional grouped configuration for local refinement, diversity control,
+        adaptive selection, and fitness sharing. Final-selection fields are
+        ignored by :class:`~sklearn_genetic.GAFeatureSelectionCV`.
+
+    population_initializer : {'smart', 'random'}, default='smart'
+        Strategy used to generate the initial population. ``'smart'`` creates
+        duplicate-aware feature masks with a spread of selected-feature counts.
+        ``'random'`` uses the previous weighted random feature-mask sampling.
+
+    local_search : bool, default=False
+        If ``True``, run a short local refinement phase around the current
+        hall-of-fame feature masks after the genetic search finishes.
+
+    local_search_top_k : int, default=1
+        Number of hall-of-fame feature masks used as local-search seeds.
+
+    local_search_steps : int, default=1
+        Number of neighbor feature masks generated per local-search seed.
+
+    local_search_radius : float, default=0.1
+        Fraction of features to flip when sampling a local neighbor.
+
+    diversity_control : bool, default=True
+        If ``True``, monitor diversity and stagnation to boost mutation,
+        replace duplicate candidates, and inject random immigrants.
+
+    diversity_threshold : float, default=0.25
+        Diversity value below which diversity control can trigger.
+
+    diversity_stagnation_generations : int, default=5
+        Number of stagnant generations after which diversity control can
+        inject random immigrants.
+
+    diversity_mutation_boost : float, default=2.0
+        Multiplicative boost applied to mutation probability when diversity
+        control triggers. The boosted value is capped to DEAP's valid range.
+
+    random_immigrants_fraction : float, default=0.1
+        Fraction of offspring replaced by random immigrants when diversity
+        control triggers.
+
+    adaptive_selection : bool, default=False
+        If ``True``, adapt tournament size from generation telemetry. Selection
+        pressure is reduced when diversity is low or the search is stagnant,
+        and slightly increased when the population is improving with enough
+        diversity.
+
+    selection_pressure_min : int, default=2
+        Minimum tournament size used by adaptive selection.
+
+    selection_pressure_max : int, default=None
+        Maximum tournament size used by adaptive selection. If ``None``, the
+        maximum is one larger than ``tournament_size``.
+
+    offspring_diversity_retries : int, default=0
+        Number of retries used when replacing duplicate or parent-matching
+        offspring with new random feature masks.
+
+    fitness_sharing : bool, default=False
+        If ``True``, temporarily penalize candidates in crowded niches during
+        selection. Raw cross-validation scores and ``cv_results_`` are not
+        modified.
+
+    sharing_radius : float, default=0.2
+        Normalized distance below which two individuals are considered part of
+        the same niche for fitness sharing.
+
+    sharing_alpha : float, default=1.0
+        Shape parameter that controls how quickly sharing pressure decreases
+        with distance inside ``sharing_radius``.
 
     generations : int, default=40
         Number of generations or iterations to run the evolutionary algorithm.
@@ -716,6 +1423,7 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
 
         - a single string;
         - a callable that returns a single value.
+
         If `scoring` represents multiple scores, one can use:
 
         - a list or tuple of unique strings;
@@ -724,8 +1432,9 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         - a dictionary with metric names as keys and callables a values.
 
     n_jobs : int, default=None
-        Number of jobs to run in parallel. Training the estimator and computing
-        the score are parallelized over the cross-validation splits.
+        Number of jobs to run in parallel. Candidate evaluations in each
+        generation are parallelized when possible; each candidate then runs
+        cross-validation sequentially to avoid nested parallelism.
         ``None`` means 1 unless in a :obj:`joblib.parallel_backend` context.
         ``-1`` means using all processors.
 
@@ -766,15 +1475,9 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         Controls the number of jobs that get dispatched during parallel
         execution. Reducing this number can be useful to avoid an
         explosion of memory consumption when more jobs get dispatched
-        than CPUs can process. This parameter can be:
-            - None, in which case all the jobs are immediately
-              created and spawned. Use this for lightweight and
-              fast-running jobs, to avoid delays due to on-demand
-              spawning of the jobs
-            - An int, giving the exact number of total jobs that are
-              spawned
-            - A str, giving an expression as a function of n_jobs,
-              as in '2*n_jobs'
+        than CPUs can process. This parameter can be ``None`` to dispatch all
+        jobs immediately, an integer number of total jobs to spawn, or a string
+        expression as a function of ``n_jobs``, such as ``'2*n_jobs'``.
 
     error_score : 'raise' or numeric, default=np.nan
         Value to assign to the score if an error occurs in estimator fitting.
@@ -794,21 +1497,20 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         Configuration to log metrics and models to mlflow, of None,
         no mlflow logging will be performed
 
+    use_cache: bool, default=True
+        If set to true it will avoid to re-evaluating solutions that have already seen,
+        otherwise it will always evaluate the solutions to get the performance metrics
+
     Attributes
     ----------
 
     logbook : :class:`DEAP.tools.Logbook`
         Contains the logs of every set of hyperparameters fitted with its average scoring metric.
     history : dict
-        Dictionary of the form:
-        {"gen": [],
-        "fitness": [],
-        "fitness_std": [],
-        "fitness_max": [],
-        "fitness_min": []}
-
-         *gen* returns the index of the evaluated generations.
-         Each entry on the others lists, represent the average metric in each generation.
+        Dictionary with one list per generation. It includes ``gen``,
+        ``fitness``, ``fitness_std``, ``fitness_best``, ``fitness_max``, ``fitness_min``,
+        population diversity fields, stagnation fields, optimizer-control
+        telemetry, and local-refinement telemetry.
 
     cv_results_ : dict of numpy (masked) ndarrays
         A dict with keys as column headers and values as columns, that can be
@@ -832,6 +1534,11 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
     refit_time_ : float
         Seconds used for refitting the best model on the whole dataset.
         This is present only if ``refit`` is not False.
+    fit_stats_ : dict
+        Counters collected during the last ``fit`` call. Includes evaluated
+        candidates, unique candidates, cross-validation calls, cache hits,
+        duplicate candidates, skipped invalid candidates, and population-level
+        parallel/serial batch counts.
     """
 
     def __init__(
@@ -841,8 +1548,8 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         scoring=None,
         population_size=50,
         generations=80,
-        crossover_probability=0.2,
-        mutation_probability=0.8,
+        crossover_probability=0.8,
+        mutation_probability=0.1,
         tournament_size=3,
         elitism=True,
         max_features=None,
@@ -851,12 +1558,121 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         criteria="max",
         algorithm="eaMuPlusLambda",
         refit=True,
-        n_jobs=1,
+        n_jobs=None,
         pre_dispatch="2*n_jobs",
         error_score=np.nan,
         return_train_score=False,
         log_config=None,
+        use_cache=True,
+        evolution_config=None,
+        population_config=None,
+        runtime_config=None,
+        optimization_config=None,
+        parallel_backend="auto",
+        population_initializer="smart",
+        random_state=None,
+        local_search=False,
+        local_search_top_k=1,
+        local_search_steps=1,
+        local_search_radius=0.1,
+        diversity_control=True,
+        diversity_threshold=0.25,
+        diversity_stagnation_generations=5,
+        diversity_mutation_boost=2.0,
+        random_immigrants_fraction=0.1,
+        adaptive_selection=False,
+        selection_pressure_min=2,
+        selection_pressure_max=None,
+        offspring_diversity_retries=0,
+        fitness_sharing=False,
+        sharing_radius=0.2,
+        sharing_alpha=1.0,
     ):
+        population_size = _resolve_config_value(
+            evolution_config, "population_size", population_size
+        )
+        generations = _resolve_config_value(evolution_config, "generations", generations)
+        crossover_probability = _resolve_config_value(
+            evolution_config, "crossover_probability", crossover_probability
+        )
+        mutation_probability = _resolve_config_value(
+            evolution_config, "mutation_probability", mutation_probability
+        )
+        tournament_size = _resolve_config_value(
+            evolution_config, "tournament_size", tournament_size
+        )
+        elitism = _resolve_config_value(evolution_config, "elitism", elitism)
+        keep_top_k = _resolve_config_value(evolution_config, "keep_top_k", keep_top_k)
+        criteria = _resolve_config_value(evolution_config, "criteria", criteria)
+        algorithm = _resolve_config_value(evolution_config, "algorithm", algorithm)
+
+        population_initializer = _resolve_config_value(
+            population_config, "initializer", population_initializer
+        )
+
+        n_jobs = _resolve_config_value(runtime_config, "n_jobs", n_jobs)
+        pre_dispatch = _resolve_config_value(runtime_config, "pre_dispatch", pre_dispatch)
+        error_score = _resolve_config_value(runtime_config, "error_score", error_score)
+        return_train_score = _resolve_config_value(
+            runtime_config, "return_train_score", return_train_score
+        )
+        use_cache = _resolve_config_value(runtime_config, "use_cache", use_cache)
+        parallel_backend = _resolve_config_value(
+            runtime_config, "parallel_backend", parallel_backend
+        )
+        verbose = _resolve_config_value(runtime_config, "verbose", verbose)
+
+        local_search = _resolve_config_value(optimization_config, "local_search", local_search)
+        local_search_top_k = _resolve_config_value(
+            optimization_config, "local_search_top_k", local_search_top_k
+        )
+        local_search_steps = _resolve_config_value(
+            optimization_config, "local_search_steps", local_search_steps
+        )
+        local_search_radius = _resolve_config_value(
+            optimization_config, "local_search_radius", local_search_radius
+        )
+        diversity_control = _resolve_config_value(
+            optimization_config, "diversity_control", diversity_control
+        )
+        diversity_threshold = _resolve_config_value(
+            optimization_config, "diversity_threshold", diversity_threshold
+        )
+        diversity_stagnation_generations = _resolve_config_value(
+            optimization_config,
+            "diversity_stagnation_generations",
+            diversity_stagnation_generations,
+        )
+        diversity_mutation_boost = _resolve_config_value(
+            optimization_config, "diversity_mutation_boost", diversity_mutation_boost
+        )
+        random_immigrants_fraction = _resolve_config_value(
+            optimization_config, "random_immigrants_fraction", random_immigrants_fraction
+        )
+        adaptive_selection = _resolve_config_value(
+            optimization_config, "adaptive_selection", adaptive_selection
+        )
+        selection_pressure_min = _resolve_config_value(
+            optimization_config, "selection_pressure_min", selection_pressure_min
+        )
+        selection_pressure_max = _resolve_config_value(
+            optimization_config, "selection_pressure_max", selection_pressure_max
+        )
+        offspring_diversity_retries = _resolve_config_value(
+            optimization_config, "offspring_diversity_retries", offspring_diversity_retries
+        )
+        fitness_sharing = _resolve_config_value(
+            optimization_config, "fitness_sharing", fitness_sharing
+        )
+        sharing_radius = _resolve_config_value(
+            optimization_config, "sharing_radius", sharing_radius
+        )
+        sharing_alpha = _resolve_config_value(optimization_config, "sharing_alpha", sharing_alpha)
+
+        self.evolution_config = evolution_config
+        self.population_config = population_config
+        self.runtime_config = runtime_config
+        self.optimization_config = optimization_config
         self.estimator = estimator
         self.cv = cv
         self.scoring = scoring
@@ -880,10 +1696,55 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         self.return_train_score = return_train_score
         # self.creator = creator
         self.log_config = log_config
+        self.use_cache = use_cache
+        self.fitness_cache = {}
+        self.parallel_backend = parallel_backend
+        self.population_initializer = population_initializer
+        self.random_state = random_state
+        self.local_search = local_search
+        self.local_search_top_k = local_search_top_k
+        self.local_search_steps = local_search_steps
+        self.local_search_radius = local_search_radius
+        self.diversity_control = diversity_control
+        self.diversity_threshold = diversity_threshold
+        self.diversity_stagnation_generations = diversity_stagnation_generations
+        self.diversity_mutation_boost = diversity_mutation_boost
+        self.random_immigrants_fraction = random_immigrants_fraction
+        self.adaptive_selection = adaptive_selection
+        self.selection_pressure_min = selection_pressure_min
+        self.selection_pressure_max = selection_pressure_max
+        self.offspring_diversity_retries = offspring_diversity_retries
+        self.fitness_sharing = fitness_sharing
+        self.sharing_radius = sharing_radius
+        self.sharing_alpha = sharing_alpha
 
-        # Check that the estimator is compatible with scikit-learn
-        if not is_classifier(self.estimator) and not is_regressor(self.estimator):
-            raise ValueError(f"{self.estimator} is not a valid Sklearn classifier or regressor")
+        _validate_parallel_backend(self.parallel_backend)
+        _validate_error_score(self.error_score)
+        _validate_population_initializer(self.population_initializer)
+        _validate_optimizer_control(
+            self.local_search_top_k,
+            self.local_search_steps,
+            self.local_search_radius,
+            self.diversity_threshold,
+            self.diversity_stagnation_generations,
+            self.diversity_mutation_boost,
+            self.random_immigrants_fraction,
+            self.sharing_radius,
+            self.sharing_alpha,
+            self.selection_pressure_min,
+            self.selection_pressure_max,
+            self.offspring_diversity_retries,
+        )
+
+        # added new check for whether the estimator is compatible with scikit-learn
+        if not (
+            _is_classifier(self.estimator)
+            or _is_regressor(self.estimator)
+            or _is_outlier_detector(self.estimator)
+        ):
+            raise ValueError(
+                f"{self.estimator} is not a valid Sklearn classifier, regressor, or outlier detector"
+            )
 
         if criteria not in Criteria.list():
             raise ValueError(f"Criteria must be one of {Criteria.list()}, got {criteria} instead")
@@ -909,26 +1770,27 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         # Each binary value represents if the feature is selected or not
 
         self.toolbox.register(
-            "individual",
+            "individual_raw",
             weighted_bool_individual,
             creator.Individual,
             weight=self.features_proportion,
             size=self.n_features,
         )
+        self.toolbox.register("individual", self._new_feature_individual)
 
         self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
 
-        self.toolbox.register("mate", cxUniform, indpb=self.crossover_adapter.current_value)
-        self.toolbox.register("mutate", mutFlipBit, indpb=self.mutation_adapter.current_value)
+        self.toolbox.register("mate_raw", cxUniform, indpb=self.crossover_adapter.current_value)
+        self.toolbox.register("mutate_raw", mutFlipBit, indpb=self.mutation_adapter.current_value)
+        self.toolbox.register("mate", self.mate)
+        self.toolbox.register("mutate", self.mutate)
 
-        if self.elitism:
-            self.toolbox.register("select", tools.selTournament, tournsize=self.tournament_size)
-        else:
-            self.toolbox.register("select", tools.selRoulette)
+        self.toolbox.register("select", self.select)
 
         self.toolbox.register("evaluate", self.evaluate)
+        self.toolbox.register("evaluate_population", self.evaluate_population)
 
-        self._pop = self.toolbox.population(n=self.population_size)
+        self._pop = self._initialize_population()
         self._hof = tools.HallOfFame(self.keep_top_k)
 
         # Stats among axis 0 to get two values:
@@ -940,6 +1802,150 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         self._stats.register("fitness_min", np.min, axis=0)
 
         self.logbook = tools.Logbook()
+
+    def _initialize_population(self):
+        population = initialize_feature_population(self, self.toolbox, creator.Individual)
+        for individual in population:
+            self._repair_individual(individual)
+        return population
+
+    def select(self, population, k):
+        if not self.elitism:
+            self._selection_pressure_ = None
+            return tools.selRoulette(population, k)
+
+        tournament_size = adaptive_tournament_size(
+            self,
+            getattr(self, "_last_generation_record", None),
+            len(population),
+        )
+        self._selection_pressure_ = tournament_size
+        return tools.selTournament(population, k, tournsize=tournament_size)
+
+    def _repair_individual(self, individual):
+        for index, value in enumerate(individual):
+            individual[index] = 1 if value else 0
+
+        max_features = getattr(self, "max_features", None)
+
+        if max_features and sum(individual) > max_features:
+            selected = [index for index, value in enumerate(individual) if value]
+            random.shuffle(selected)
+            for index in selected[max_features:]:
+                individual[index] = 0
+
+        if sum(individual) == 0:
+            individual[random.randrange(0, len(individual))] = 1
+
+        return individual
+
+    def _new_feature_individual(self):
+        return self._repair_individual(self.toolbox.individual_raw())
+
+    def mate(self, individual_1, individual_2):
+        offspring_1, offspring_2 = self.toolbox.mate_raw(individual_1, individual_2)
+        self._repair_individual(offspring_1)
+        self._repair_individual(offspring_2)
+        return offspring_1, offspring_2
+
+    def mutate(self, individual):
+        (mutated,) = self.toolbox.mutate_raw(individual)
+        self._repair_individual(mutated)
+        return (mutated,)
+
+    def _individual_key(self, individual):
+        return tuple(individual)
+
+    def evaluate_population(self, individuals):
+        for individual in individuals:
+            self._repair_individual(individual)
+        return _evaluate_population_batch(self, individuals, "current_generation_features")
+
+    def _build_feature_evaluation_record(self, current_generation_params, cv_results):
+        cv_scores = cv_results[f"test_{self.refit_metric}"]
+        score = np.mean(cv_scores)
+
+        current_generation_params["score"] = score
+        current_generation_params["cv_scores"] = cv_scores
+        current_generation_params["fit_time"] = cv_results["fit_time"]
+        current_generation_params["score_time"] = cv_results["score_time"]
+
+        for metric in self.metrics_list:
+            current_generation_params[f"test_{metric}"] = cv_results[f"test_{metric}"]
+
+            if self.return_train_score:
+                current_generation_params[f"train_{metric}"] = cv_results[f"train_{metric}"]
+
+        return score, current_generation_params
+
+    def _penalized_feature_cv_results(self, score):
+        cv_results = {
+            "fit_time": np.zeros(self.n_splits_),
+            "score_time": np.zeros(self.n_splits_),
+        }
+
+        for metric in self.metrics_list:
+            cv_results[f"test_{metric}"] = np.full(self.n_splits_, score)
+
+            if self.return_train_score:
+                cv_results[f"train_{metric}"] = np.full(self.n_splits_, score)
+
+        return cv_results
+
+    def _evaluate_individual(self, individual, n_jobs=None):
+        self._repair_individual(individual)
+        bool_individual = np.array(individual, dtype=bool)
+
+        current_generation_params = {"features": bool_individual}
+
+        n_selected_features = np.sum(individual)
+
+        max_features = getattr(self, "max_features", None)
+
+        if max_features and (n_selected_features > max_features or n_selected_features == 0):
+            score = -self.criteria_sign * 100000
+            cv_results = self._penalized_feature_cv_results(score)
+            _, current_generation_params = self._build_feature_evaluation_record(
+                current_generation_params, cv_results
+            )
+
+            fitness_result = [score, n_selected_features]
+
+            return fitness_result, current_generation_params, False, True
+
+        local_estimator = clone(self.estimator)
+
+        # Use standard cross_validate for all estimator types. Only X is
+        # feature-sliced; fit params such as sample_weight stay aligned to
+        # samples and are sliced per CV fold by scikit-learn.
+        cv_results = cross_validate(
+            local_estimator,
+            self.X_[:, bool_individual],
+            self.y_,
+            cv=self._cv_splits,
+            scoring=self.scorer_,
+            n_jobs=n_jobs,
+            pre_dispatch=self.pre_dispatch,
+            error_score=self.error_score,
+            return_train_score=self.return_train_score,
+            params=getattr(self, "_fit_params", None) or None,
+        )
+
+        score, current_generation_params = self._build_feature_evaluation_record(
+            current_generation_params, cv_results
+        )
+
+        # Uses the log config to save in remote log server (e.g MLflow)
+        if self.log_config is not None:
+            self.log_config.create_run(
+                parameters=current_generation_params,
+                score=score,
+                estimator=local_estimator,
+            )
+
+        fitness_result = [score, n_selected_features]
+
+        return fitness_result, current_generation_params, True, False
 
     def evaluate(self, individual):
         """
@@ -958,65 +1964,52 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
 
         """
 
-        bool_individual = np.array(individual, dtype=bool)
+        # Convert the individual to a tuple to use as a key in the cache
+        self._repair_individual(individual)
+        individual_key = self._individual_key(individual)
 
-        current_generation_params = {"features": bool_individual}
+        # Check if the individual has already been evaluated
+        if individual_key in self.fitness_cache and self.use_cache:
+            cached_result = self.fitness_cache[individual_key]
+            # Ensure the logbook is updated even if the individual is cached
+            self.logbook.record(parameters=cached_result["current_generation_features"])
+            _record_fit_stats(self, evaluated=1, cache_hits=1)
+            return cached_result["fitness"]
 
-        local_estimator = clone(self.estimator)
-        n_selected_features = np.sum(individual)
-
-        # Compute the cv-metrics using only the selected features
-        cv_results = cross_validate(
-            local_estimator,
-            self.X_[:, bool_individual],
-            self.y_,
-            cv=self.cv,
-            scoring=self.scoring,
-            n_jobs=self.n_jobs,
-            pre_dispatch=self.pre_dispatch,
-            error_score=self.error_score,
-            return_train_score=self.return_train_score,
+        candidate_n_jobs = self.n_jobs if self.parallel_backend == "cv" else 1
+        (
+            fitness_result,
+            current_generation_params,
+            used_cv,
+            skipped_invalid,
+        ) = self._evaluate_individual(
+            individual,
+            n_jobs=candidate_n_jobs,
+        )
+        current_generation_params = _logbook_record(
+            self.logbook,
+            "parameters",
+            current_generation_params,
         )
 
-        cv_scores = cv_results[f"test_{self.refit_metric}"]
-        score = np.mean(cv_scores)
+        if self.use_cache:
+            # Store the fitness result and the current generation features in the cache
+            self.fitness_cache[individual_key] = {
+                "fitness": fitness_result,
+                "current_generation_features": current_generation_params,
+            }
 
-        # Uses the log config to save in remote log server (e.g MLflow)
-        if self.log_config is not None:
-            self.log_config.create_run(
-                parameters=current_generation_params,
-                score=score,
-                estimator=local_estimator,
-            )
+        _record_fit_stats(
+            self,
+            evaluated=1,
+            unique=1,
+            cv_calls=int(used_cv),
+            skipped=int(skipped_invalid),
+        )
 
-        # These values are used to compute cv_results_ property
-        current_generation_params["score"] = score
-        current_generation_params["cv_scores"] = cv_scores
-        current_generation_params["fit_time"] = cv_results["fit_time"]
-        current_generation_params["score_time"] = cv_results["score_time"]
+        return fitness_result
 
-        for metric in self.metrics_list:
-            current_generation_params[f"test_{metric}"] = cv_results[f"test_{metric}"]
-
-            if self.return_train_score:
-                current_generation_params[f"train_{metric}"] = cv_results[f"train_{metric}"]
-
-        index = len(self.logbook.chapters["parameters"])
-        current_generation_features = {"index": index, **current_generation_params}
-
-        # Log the features and the cv-score
-        self.logbook.record(parameters=current_generation_features)
-
-        # Penalize individuals with more features than the max_features parameter
-
-        if self.max_features and (
-            n_selected_features > self.max_features or n_selected_features == 0
-        ):
-            score = -self.criteria_sign * 100000
-
-        return [score, n_selected_features]
-
-    def fit(self, X, y, callbacks=None):
+    def fit(self, X, y=None, callbacks=None, groups=None, **fit_params):
         """
         Main method of GAFeatureSelectionCV, starts the optimization
         procedure with to find the best features set
@@ -1028,32 +2021,129 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         y : array-like of shape (n_samples,) or (n_samples, n_outputs), \
             default=None
             The target variable to try to predict in the case of
-            supervised learning.
+            supervised learning. For outlier detection, y can be None.
         callbacks: list or callable
             One or a list of the callbacks methods available in
             :class:`~sklearn_genetic.callbacks`.
             The callback is evaluated after fitting the estimators from the generation 1.
+        groups : array-like of shape (n_samples,), default=None
+            Group labels for the samples used while splitting the dataset into
+            train/test sets. Only used in conjunction with a "Group" cv
+            instance such as :class:`~sklearn.model_selection.GroupKFold`.
+        **fit_params : dict of str -> object
+            Parameters passed to the ``fit`` method of the underlying
+            estimator (e.g. ``sample_weight``). They are forwarded to every
+            candidate cross-validation and to the final refit. Only ``X`` is
+            feature-sliced during the search; sample-aligned parameters stay
+            aligned to samples and are sliced per CV fold by scikit-learn.
         """
 
-        self.X_, self.y_ = check_X_y(X, y)
+        _check_feature_names(self, X, reset=True)
+        self.X_, self.y_ = check_X_y(X, y, accept_sparse=True) if y is not None else (X, None)
+        self.groups_ = groups
+        self._fit_params = fit_params
+
+        # Handle outlier detection case if y is none
+        if _is_outlier_detector(self.estimator) and y is None:
+            self.X_ = X
+            self.y_ = np.zeros(X.shape[0])
+
         self.n_features = X.shape[1]
         self._n_iterations = self.generations + 1
         self.refit_metric = "score"
         self.multimetric_ = False
 
         self.features_proportion = None
-        if self.max_features:
-            self.features_proportion = self.max_features / self.n_features
+        max_features = getattr(self, "max_features", None)
+        if max_features:
+            self.features_proportion = max_features / self.n_features
 
         # Make sure the callbacks are valid
         self.callbacks = check_callback(callbacks)
+
+        checkpoint_loaded = False
+        restored_logbook = None
+        restored_fit_stats = None
+        restored_generation_log = None
+        restored_adapter_state = None
+
+        # Load state if a checkpoint exists
+        for callback in self.callbacks:
+            if isinstance(callback, ModelCheckpoint):
+                if os.path.exists(callback.checkpoint_path):
+                    checkpoint_data = callback.load()
+                    if checkpoint_data:
+                        self.__dict__.update(checkpoint_data["estimator_state"])  # noqa
+                        # Restore the fitness cache so already-evaluated
+                        # candidates are reused instead of re-evaluated. Older
+                        # checkpoints have no ``runtime_state``, so guard with
+                        # .get() for backward compatibility.
+                        runtime_state = checkpoint_data.get("runtime_state") or {}
+                        cached = runtime_state.get("fitness_cache")
+                        if cached is not None:
+                            self.fitness_cache = cached
+                        restored_fit_stats = runtime_state.get("fit_stats_")
+                        # ``checkpoint_data["logbook"]`` is the per-*generation*
+                        # summary log (see ModelCheckpoint.on_step), not
+                        # ``self.logbook`` -- restoring it onto ``self.logbook``
+                        # would silently break ``cv_results_``/``history``.
+                        # ``_register()`` below also unconditionally creates a
+                        # fresh ``self.logbook``, so stash the real one and put
+                        # it back afterwards (see comment near the
+                        # ``_register()`` call).
+                        restored_logbook = runtime_state.get("candidate_logbook")
+                        # The per-generation summary log saved under the
+                        # legacy ``"logbook"`` key is exactly what generation
+                        # numbering needs to continue from -- see
+                        # ``_seed_logbook`` in ``algorithms.py``.
+                        restored_generation_log = checkpoint_data.get("logbook")
+                        restored_adapter_state = runtime_state.get("adapter_state")
+                        checkpoint_loaded = True
+                    break
+
+        # Seed after the checkpoint (if any) is loaded: ``self.__dict__.update()``
+        # above may have just replaced ``self.random_state`` with the value from
+        # a resumed run's checkpoint, and seeding before that point would use the
+        # pre-resume value instead (see #299).
+        _seed_global_rngs(self.random_state)
+
+        if checkpoint_loaded and restored_adapter_state is not None:
+            # Restore the crossover/mutation adapter step counters so the
+            # schedule continues from where the previous run left off
+            # instead of restarting from step 0 (see adapter checkpoint).
+            self.crossover_adapter.load_state_dict(restored_adapter_state["crossover"])
+            self.mutation_adapter.load_state_dict(restored_adapter_state["mutation"])
+        elif not checkpoint_loaded:
+            _reset_adapters(self)
+
+        # Preserve cumulative counters across a resume instead of zeroing them,
+        # so e.g. ``cache_hits``/``evaluated_candidates`` reflect the whole run.
+        self.fit_stats_ = (
+            restored_fit_stats if restored_fit_stats is not None else _create_fit_stats()
+        )
+        self._resume_generation_log = restored_generation_log
 
         if callable(self.scoring):
             self.scorer_ = self.scoring
             self.metrics_list = [self.refit_metric]
         elif self.scoring is None or isinstance(self.scoring, str):
-            self.scorer_ = check_scoring(self.estimator, self.scoring)
-            self.metrics_list = [self.refit_metric]
+            # Handle outlier detectors that don't have a score method
+            if _is_outlier_detector(self.estimator) and self.scoring is None:
+                # this function creates a default scorer for outlier detection
+                def default_outlier_scorer(estimator, X, y=None):
+                    if hasattr(estimator, "score_samples"):
+                        return np.mean(estimator.score_samples(X))
+                    elif hasattr(estimator, "decision_function"):
+                        return np.mean(estimator.decision_function(X))
+                    else:
+                        predictions = estimator.fit_predict(X)
+                        return np.mean(predictions == 1)
+
+                self.scorer_ = default_outlier_scorer
+                self.metrics_list = [self.refit_metric]
+            else:
+                self.scorer_ = check_scoring(self.estimator, self.scoring)
+                self.metrics_list = [self.refit_metric]
         else:
             self.scorer_ = _check_multimetric_scoring(self.estimator, self.scoring)
             self._check_refit_for_multimetric(self.scorer_)
@@ -1061,12 +2151,30 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
             self.metrics_list = self.scorer_.keys()
             self.multimetric_ = True
 
+        # Only pass groups when given, so custom splitters written without a
+        # groups argument keep working when no groups are used.
+        cv_groups_kwargs = {} if self.groups_ is None else {"groups": self.groups_}
+
         # Check cv and get the n_splits
-        cv_orig = check_cv(self.cv, y, classifier=is_classifier(self.estimator))
-        self.n_splits_ = cv_orig.get_n_splits(X, y)
+        if _is_outlier_detector(self.estimator):
+            from sklearn.model_selection import KFold
+
+            cv_orig = KFold(n_splits=self.cv if isinstance(self.cv, int) else 5)
+            self.n_splits_ = cv_orig.get_n_splits(X, self.y_)
+        else:
+            cv_orig = check_cv(self.cv, self.y_, classifier=_is_classifier(self.estimator))
+            self.n_splits_ = cv_orig.get_n_splits(X, self.y_, **cv_groups_kwargs)
+        self._cv_splits = list(cv_orig.split(self.X_, self.y_, **cv_groups_kwargs))
 
         # Set the DEAPs necessary methods
         self._register()
+        # ``_register()`` always creates a fresh, empty ``self.logbook`` (it
+        # also builds the toolbox/population/hof/stats, which are ``deap``
+        # objects that cannot be checkpointed and are intentionally rebuilt on
+        # every ``fit`` call). Put the restored per-candidate logbook back so
+        # resumed candidates are not dropped from ``cv_results_``/``history``.
+        if restored_logbook is not None:
+            self.logbook = restored_logbook
 
         # Optimization routine from the selected evolutionary algorithm
         pop, log, n_gen = self._select_algorithm(pop=self._pop, stats=self._stats, hof=self._hof)
@@ -1087,15 +2195,37 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
             "gen": log.select("gen"),
             "fitness": log.select("fitness"),
             "fitness_std": log.select("fitness_std"),
+            "fitness_best": log.select("fitness_best"),
             "fitness_max": log.select("fitness_max"),
             "fitness_min": log.select("fitness_min"),
+            "population_size": log.select("population_size"),
+            "unique_individuals": log.select("unique_individuals"),
+            "unique_individual_ratio": log.select("unique_individual_ratio"),
+            "genotype_diversity": log.select("genotype_diversity"),
+            "fitness_improvement": log.select("fitness_improvement"),
+            "fitness_improved": log.select("fitness_improved"),
+            "stagnation_generations": log.select("stagnation_generations"),
+            "best_generation": log.select("best_generation"),
+            "mutation_probability": log.select("mutation_probability"),
+            "selection_pressure": log.select("selection_pressure"),
+            "diversity_control_triggered": log.select("diversity_control_triggered"),
+            "random_immigrants": log.select("random_immigrants"),
+            "duplicate_replacements": log.select("duplicate_replacements"),
+            "local_refinements": log.select("local_refinements"),
+            "fitness_sharing_applied": log.select("fitness_sharing_applied"),
+            "mean_niche_count": log.select("mean_niche_count"),
+            "max_niche_count": log.select("max_niche_count"),
         }
 
         if self.refit:
             bool_individual = np.array(self.best_features_, dtype=bool)
 
             refit_start_time = time.time()
-            self.estimator.fit(self.X_[:, bool_individual], self.y_)
+            self.estimator.fit(
+                self.X_[:, bool_individual],
+                self.y_,
+                **getattr(self, "_fit_params", {}),
+            )
             refit_end_time = time.time()
             self.refit_time_ = refit_end_time - refit_start_time
 
@@ -1108,119 +2238,6 @@ class GAFeatureSelectionCV(MetaEstimatorMixin, SelectorMixin, BaseEstimator):
         del creator.Individual
 
         return self
-
-    def _select_algorithm(self, pop, stats, hof):
-        """
-        It selects the algorithm to run from the sklearn_genetic.algorithms module
-        based in the parameter self.algorithm.
-
-        Parameters
-        ----------
-        pop: pop object from DEAP
-        stats: stats object from DEAP
-        hof: hof object from DEAP
-
-        Returns
-        -------
-        pop: pop object
-            The last evaluated population
-        log: Logbook object
-            It contains the calculated metrics {'fitness', 'fitness_std', 'fitness_max', 'fitness_min'}
-            the number of generations and the number of evaluated individuals per generation
-        n_gen: int
-            The number of generations that the evolutionary algorithm ran
-        """
-
-        selected_algorithm = algorithms_factory.get(self.algorithm, None)
-        if selected_algorithm:
-            pop, log, gen = selected_algorithm(
-                pop,
-                self.toolbox,
-                mu=self.population_size,
-                lambda_=2 * self.population_size,
-                cxpb=self.crossover_adapter,
-                stats=stats,
-                mutpb=self.mutation_adapter,
-                ngen=self.generations,
-                halloffame=hof,
-                callbacks=self.callbacks,
-                verbose=self.verbose,
-                estimator=self,
-            )
-
-        else:
-            raise ValueError(
-                f"The algorithm {self.algorithm} is not supported, "
-                f"please select one from {Algorithms.list()}"
-            )
-
-        return pop, log, gen
-
-    def _run_search(self, evaluate_candidates):
-        pass  # noqa
-
-    @property
-    def _fitted(self):
-        try:
-            check_is_fitted(self.estimator)
-            is_fitted = True
-        except Exception as e:
-            is_fitted = False
-
-        has_history = hasattr(self, "history") and bool(self.history)
-        return all([is_fitted, has_history, self.refit])
-
-    def __getitem__(self, index):
-        """
-
-        Parameters
-        ----------
-        index: slice required to get
-
-        Returns
-        -------
-        Best solution of the iteration corresponding to the index number
-        """
-        if not self._fitted:
-            raise NotFittedError(
-                f"This GAFeatureSelectionCV instance is not fitted yet "
-                f"or used refit=False. Call 'fit' with appropriate "
-                f"arguments before using this estimator."
-            )
-
-        return {
-            "gen": self.history["gen"][index],
-            "fitness": self.history["fitness"][index],
-            "fitness_std": self.history["fitness_std"][index],
-            "fitness_max": self.history["fitness_max"][index],
-            "fitness_min": self.history["fitness_min"][index],
-        }
-
-    def __iter__(self):
-        self.n = 0
-        return self
-
-    def __next__(self):
-        """
-        Returns
-        -------
-        Iteration over the statistics found in each generation
-        """
-        if self.n < self._n_iterations + 1:
-            result = self.__getitem__(self.n)
-            self.n += 1
-            return result
-        else:
-            raise StopIteration  # pragma: no cover
-
-    def __len__(self):
-        """
-        Returns
-        -------
-        Number of generations fitted if .fit method has been called,
-        self.generations otherwise
-        """
-        return self._n_iterations
 
     def _check_refit_for_multimetric(self, scores):  # pragma: no cover
         """Check `refit` is compatible with `scores` is valid"""

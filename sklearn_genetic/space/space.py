@@ -1,6 +1,8 @@
+import random
+from typing import Any, List, Optional, Union
+
 import numpy as np
 from scipy import stats
-import random
 
 from .space_parameters import (
     IntegerDistributions,
@@ -15,11 +17,11 @@ class Integer(BaseDimension):
 
     def __init__(
         self,
-        lower: int = None,
-        upper: int = None,
+        lower: Optional[int] = None,
+        upper: Optional[int] = None,
         distribution: str = "uniform",
-        random_state=None,
-    ):
+        random_state: Optional[Union[int, np.random.Generator]] = None,
+    ) -> None:
         """
         Parameters
         ----------
@@ -53,12 +55,20 @@ class Integer(BaseDimension):
         self.upper = upper
         self.distribution = distribution
         self.random_state = random_state
-        self.rng = None if not self.random_state else np.random.default_rng(self.random_state)
+        self.rng = (
+            np.random.default_rng(self.random_state) if self.random_state is not None else None
+        )
 
         if self.distribution == IntegerDistributions.uniform.value:
             self.rvs = stats.randint.rvs
 
-    def sample(self):
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(lower={self.lower}, upper={self.upper}, "
+            f"distribution={self.distribution!r})"
+        )
+
+    def sample(self) -> int:
         """Sample a random value from the assigned distribution"""
 
         return self.rvs(self.lower, self.upper + 1, random_state=self.rng)
@@ -69,11 +79,11 @@ class Continuous(BaseDimension):
 
     def __init__(
         self,
-        lower: float = None,
-        upper: float = None,
+        lower: Optional[float] = None,
+        upper: Optional[float] = None,
         distribution: str = "uniform",
-        random_state=None,
-    ):
+        random_state: Optional[Union[int, np.random.Generator]] = None,
+    ) -> None:
         """
         Parameters
         ----------
@@ -108,7 +118,9 @@ class Continuous(BaseDimension):
         self.distribution = distribution
         self.shifted_upper = self.upper
         self.random_state = random_state
-        self.rng = None if not self.random_state else np.random.default_rng(self.random_state)
+        self.rng = (
+            np.random.default_rng(self.random_state) if self.random_state is not None else None
+        )
 
         if self.distribution == ContinuousDistributions.uniform.value:
             self.rvs = stats.uniform.rvs
@@ -116,7 +128,13 @@ class Continuous(BaseDimension):
         elif self.distribution == ContinuousDistributions.log_uniform.value:
             self.rvs = stats.loguniform.rvs
 
-    def sample(self):
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(lower={self.lower}, upper={self.upper}, "
+            f"distribution={self.distribution!r})"
+        )
+
+    def sample(self) -> float:
         """Sample a random value from the assigned distribution"""
 
         return self.rvs(self.lower, self.shifted_upper, random_state=self.rng)
@@ -127,11 +145,11 @@ class Categorical(BaseDimension):
 
     def __init__(
         self,
-        choices: list = None,
-        priors: list = None,
+        choices: Optional[List[Any]] = None,
+        priors: Optional[List[float]] = None,
         distribution: str = "choice",
-        random_state=None,
-    ):
+        random_state: Optional[int] = None,
+    ) -> None:
         """
         Parameters
         ----------
@@ -169,38 +187,62 @@ class Categorical(BaseDimension):
         self.choices = choices
         self.distribution = distribution
         self.random_state = random_state
-        random.seed(random_state)
-        self.rng = None if not self.random_state else np.random.default_rng(self.random_state)
+        self.rng = (
+            np.random.default_rng(self.random_state) if self.random_state is not None else None
+        )
 
-        if self.distribution == CategoricalDistributions.choice.value:
-            self.rvs = self.rng.choice if self.rng else random.choice
+    def __repr__(self) -> str:
+        if self.priors is None:
+            return f"{self.__class__.__name__}(choices={self.choices!r})"
 
-    def sample(self):
+        return f"{self.__class__.__name__}(choices={self.choices!r}, priors={self.priors!r})"
+
+    def sample(self) -> Any:
         """Sample a random value from the assigned distribution"""
 
-        return self.rvs(self.choices)
+        n_choices = len(self.choices)
+        if self.rng is not None:
+            index = self.rng.choice(n_choices, p=self.priors)
+        elif self.priors is None:
+            index = random.randrange(n_choices)
+        else:
+            index = random.choices(range(n_choices), weights=self.priors, k=1)[0]
+        # Index into the original list so the exact Python object (and its
+        # type) is returned, instead of a value numpy has coerced to one of
+        # its own scalar types (e.g. np.True_, np.int64) -- see #324.
+        return self.choices[int(index)]
 
 
 def check_space(param_grid: dict = None):
-    """
+    """Validate that ``param_grid`` is a non-empty mapping of space objects.
 
     Parameters
     ----------
     param_grid: dict, default=None
-        Dictionary with the for {"hyperparameter_name": :obj:`~sklearn_genetic.space`}
+        Dictionary of the form {"hyperparameter_name": :obj:`~sklearn_genetic.space`}
 
-    Returns
-    -------
-        Raises a Value Error if the dictionary does not have valid space instances
+    Raises
+    ------
+    ValueError
+        If ``param_grid`` is empty, or if any value is not an instance of
+        :class:`~sklearn_genetic.space.Integer`,
+        :class:`~sklearn_genetic.space.Categorical` or
+        :class:`~sklearn_genetic.space.Continuous`. The message names the
+        offending key and the type that was passed instead.
     """
     if not param_grid:
-        raise ValueError(f"param_grid can not be empty")
+        raise ValueError("param_grid can not be empty")
 
     # Make sure that each of the param_grid values are defined using one of the available Space objects
     for key, value in param_grid.items():
         if not isinstance(value, BaseDimension):
             raise ValueError(
-                f"{key} must be a valid instance of Integer, Categorical or Continuous classes"
+                f"Invalid param_grid entry for '{key}': expected a space object "
+                f"(Continuous, Integer, or Categorical), got "
+                f"{type(value).__name__} instead.\n"
+                f"Example:\n"
+                f"    from sklearn_genetic.space import Categorical\n"
+                f'    param_grid = {{"{key}": Categorical([...])}}'
             )
 
 
@@ -221,6 +263,86 @@ class Space(object):
         check_space(param_grid)
 
         self.param_grid = param_grid
+
+    def sample_warm_start(self, warm_start_values: dict):
+        """
+        Sample a predefined configuration (warm-start) or fill in random values if missing.
+
+        Parameters
+        ----------
+        warm_start_values: dict
+            Predefined configuration values for hyperparameters.
+
+        Returns
+        -------
+        A dictionary containing sampled values for each hyperparameter.
+
+        Raises
+        ------
+        ValueError
+            If ``warm_start_values`` is not a dict, contains a hyperparameter
+            name that is not in the search space (e.g. a misspelled key), or
+            assigns a value that falls outside its dimension. Missing keys are
+            allowed and filled by sampling.
+        """
+        self._validate_warm_start_config(warm_start_values)
+
+        sampled_params = {}
+        for param, dimension in self.param_grid.items():
+            if param in warm_start_values:
+                sampled_params[param] = warm_start_values[param]
+            else:
+                sampled_params[param] = dimension.sample()
+        return sampled_params
+
+    def _validate_warm_start_config(self, warm_start_values):
+        """Validate a single warm-start config against the search space."""
+        if not isinstance(warm_start_values, dict):
+            raise ValueError(
+                "Each warm_start_configs entry must be a dict mapping "
+                "hyperparameter names to values, got "
+                f"{type(warm_start_values).__name__} instead."
+            )
+
+        unknown = [name for name in warm_start_values if name not in self.param_grid]
+        if unknown:
+            raise ValueError(
+                f"warm_start_configs contains unknown hyperparameter(s) "
+                f"{sorted(unknown)} that are not in the search space. Valid "
+                f"names are {sorted(self.param_grid)}. (Check for typos, e.g. "
+                f"'max_depths' instead of 'max_depth'.)"
+            )
+
+        # Provided values must fall inside their dimension. Missing keys are
+        # intentionally allowed (they are filled by sampling).
+        for name, value in warm_start_values.items():
+            dimension = self.param_grid[name]
+            if not self.value_in_dimension(dimension, value):
+                raise ValueError(
+                    f"warm_start_configs value {value!r} for '{name}' is outside "
+                    f"its search space {dimension!r}."
+                )
+
+    @staticmethod
+    def value_in_dimension(dimension, value) -> bool:
+        """Return ``True`` if ``value`` is a valid sample for ``dimension``.
+
+        Single source of truth shared by warm-start validation and population
+        initialization (``population._is_dimension_value_valid``) so the two
+        cannot drift. NumPy scalars are accepted alongside Python numbers.
+        """
+        if isinstance(dimension, Integer):
+            return (
+                isinstance(value, (int, np.integer)) and dimension.lower <= value <= dimension.upper
+            )
+        if isinstance(dimension, Continuous):
+            return (
+                isinstance(value, (int, float, np.integer, np.floating))
+                and dimension.lower <= value <= dimension.upper
+            )
+        if isinstance(dimension, Categorical):
+            return value in dimension.choices
+        return False
 
     @property
     def dimensions(self):

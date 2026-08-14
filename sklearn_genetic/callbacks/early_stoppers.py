@@ -1,7 +1,28 @@
 from datetime import datetime
+from numbers import Integral, Real
 
 from .validations import check_stats
 from .base import BaseCallback
+
+
+def _validate_numeric(value, parameter_name):
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{parameter_name} must be a numeric value")
+
+
+def _validate_positive_integer(value, parameter_name):
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{parameter_name} must be a positive integer")
+
+    if value <= 0:
+        raise ValueError(f"{parameter_name} must be greater than 0")
+
+
+def _validate_positive_numeric(value, parameter_name):
+    _validate_numeric(value, parameter_name)
+
+    if value <= 0:
+        raise ValueError(f"{parameter_name} must be greater than 0")
 
 
 class ThresholdStopping(BaseCallback):
@@ -17,11 +38,12 @@ class ThresholdStopping(BaseCallback):
         threshold: float, default=None
             Threshold to compare against the current cross validation average score and determine if
             the optimization process must stop
-        metric: {'fitness', 'fitness_std', 'fitness_max', 'fitness_min'}, default ='fitness'
+        metric: {'fitness', 'fitness_std', 'fitness_best', 'fitness_max', 'fitness_min'}, default ='fitness'
             Name of the metric inside 'record' logged in each iteration
         """
 
         check_stats(metric)
+        _validate_numeric(threshold, "threshold")
 
         self.threshold = threshold
         self.metric = metric
@@ -54,11 +76,12 @@ class ConsecutiveStopping(BaseCallback):
         ----------
         generations: int, default=None
             Number of current generations to compare against current generation
-        metric: {'fitness', 'fitness_std', 'fitness_max', 'fitness_min'}, default ='fitness'
+        metric: {'fitness', 'fitness_std', 'fitness_best', 'fitness_max', 'fitness_min'}, default ='fitness'
             Name of the metric inside 'record' logged in each iteration
         """
 
         check_stats(metric)
+        _validate_positive_integer(generations, "generations")
 
         self.generations = generations
         self.metric = metric
@@ -100,11 +123,13 @@ class DeltaThreshold(BaseCallback):
             Threshold to compare the differences between cross-validation scores.
         generations: int, default=2
             Number of generations to compare, includes the current generation.
-        metric: {'fitness', 'fitness_std', 'fitness_max', 'fitness_min'}, default ='fitness'
+        metric: {'fitness', 'fitness_std', 'fitness_best', 'fitness_max', 'fitness_min'}, default ='fitness'
             Name of the metric inside 'record' logged in each iteration.
         """
 
         check_stats(metric)
+        _validate_numeric(threshold, "threshold")
+        _validate_positive_integer(generations, "generations")
 
         self.threshold = threshold
         self.generations = generations
@@ -141,6 +166,8 @@ class TimerStopping(BaseCallback):
         total_seconds: int
             Total time in seconds that the estimator is allowed to fit
         """
+        _validate_positive_numeric(total_seconds, "total_seconds")
+
         self.initial_training_time = None
         self.total_seconds = total_seconds
 

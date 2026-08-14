@@ -1,4 +1,19 @@
 from .genetic_search import GASearchCV, GAFeatureSelectionCV
+from .config import EvolutionConfig, OptimizationConfig, PopulationConfig, RuntimeConfig
+from .presets import (
+    extra_trees_classifier_space,
+    extra_trees_regressor_space,
+    hist_gradient_boosting_classifier_space,
+    hist_gradient_boosting_regressor_space,
+    logistic_regression_space,
+    random_forest_classifier_space,
+    random_forest_regressor_space,
+    svc_space,
+    xgboost_classifier_space,
+    xgboost_regressor_space,
+    list_preset_profiles,
+    list_preset_spaces,
+)
 
 from .callbacks import (
     ThresholdStopping,
@@ -19,6 +34,22 @@ from ._version import __version__
 __all__ = [
     "GASearchCV",
     "GAFeatureSelectionCV",
+    "EvolutionConfig",
+    "OptimizationConfig",
+    "PopulationConfig",
+    "RuntimeConfig",
+    "extra_trees_classifier_space",
+    "extra_trees_regressor_space",
+    "hist_gradient_boosting_classifier_space",
+    "hist_gradient_boosting_regressor_space",
+    "logistic_regression_space",
+    "random_forest_classifier_space",
+    "random_forest_regressor_space",
+    "svc_space",
+    "xgboost_classifier_space",
+    "xgboost_regressor_space",
+    "list_preset_profiles",
+    "list_preset_spaces",
     "ThresholdStopping",
     "ConsecutiveStopping",
     "DeltaThreshold",

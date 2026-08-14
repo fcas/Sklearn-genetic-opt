@@ -68,8 +68,14 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
-docs/_build/
+# sklearn-genetic-opt generated artifacts
+logs/
+sklearn_logs/
+mlruns/
+mlflow.db
+logbook.pkl
+*.tfevents.*
+benchmarks/*.json
 
 # PyBuilder
 target/
@@ -133,3 +139,4 @@ dmypy.json
 
 #VSCode
 .vscode
+.codex_tmp/

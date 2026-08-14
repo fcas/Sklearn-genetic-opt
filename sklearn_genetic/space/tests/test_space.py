@@ -1,7 +1,35 @@
+from collections import Counter
+from typing import Any
+
 import pytest
+import numpy as np
+from scipy import stats
 
 from ..space import Categorical, Integer, Continuous, Space
+from ..converters import from_sklearn_space
 from ..base import BaseDimension
+
+
+@pytest.mark.parametrize(
+    "space_object, expected_repr",
+    [
+        (
+            Continuous(0.01, 1.0, distribution="log-uniform"),
+            "Continuous(lower=0.01, upper=1.0, distribution='log-uniform')",
+        ),
+        (Integer(10, 200), "Integer(lower=10, upper=200, distribution='uniform')"),
+        (
+            Categorical(["rbf", "linear", "poly"]),
+            "Categorical(choices=['rbf', 'linear', 'poly'])",
+        ),
+        (
+            Categorical(["a", "b"], priors=[0.8, 0.2]),
+            "Categorical(choices=['a', 'b'], priors=[0.8, 0.2])",
+        ),
+    ],
+)
+def test_space_repr(space_object, expected_repr):
+    assert repr(space_object) == expected_repr
 
 
 @pytest.mark.parametrize(
@@ -92,6 +120,140 @@ def test_categorical_bad_parameters(data_object, parameters, message):
     assert str(excinfo.value) == message
 
 
+def test_categorical_random_state_is_deterministic():
+    """Same random_state yields the same sample sequence (#296).
+
+    This exercises the seeded ``rng.choice`` path, which the existing sampling
+    tests (using no ``random_state``) do not cover.
+    """
+    choices = ["a", "b", "c", "d"]
+    first = Categorical(choices, random_state=42)
+    second = Categorical(choices, random_state=42)
+
+    seq_first = [first.sample() for _ in range(15)]
+    seq_second = [second.sample() for _ in range(15)]
+
+    assert seq_first == seq_second
+    # Every draw is a valid choice.
+    assert all(value in choices for value in seq_first)
+
+
+def test_categorical_sampling_with_priors_stays_in_choices():
+    """A priored categorical only ever samples declared choices (#296)."""
+    choices = ["x", "y", "z"]
+    dimension = Categorical(choices, priors=[0.2, 0.3, 0.5], random_state=7)
+
+    assert dimension.priors == [0.2, 0.3, 0.5]
+    assert all(dimension.sample() in choices for _ in range(50))
+
+
+def test_categorical_priors_skew_sampling_with_numpy_rng():
+    """Priors must actually bias sampling, not just be stored (#314).
+
+    Uses the seeded ``rng.choice`` path (random_state is given). With a heavy
+    98/2 skew over 4000 draws, an unweighted 50/50 draw is statistically
+    impossible to land in the assertion window below.
+    """
+    dimension = Categorical(["a", "b"], priors=[0.98, 0.02], random_state=1)
+
+    counts = Counter(dimension.sample() for _ in range(4000))
+
+    assert counts["a"] > 3500
+    assert counts["b"] < 500
+
+
+def test_categorical_priors_skew_sampling_with_stdlib_random():
+    """Same as above, but exercising the unseeded ``random.choices`` path (#314)."""
+    dimension = Categorical(["a", "b"], priors=[0.98, 0.02])
+
+    counts = Counter(dimension.sample() for _ in range(4000))
+
+    assert counts["a"] > 3500
+    assert counts["b"] < 500
+
+
+def test_categorical_random_state_zero_uses_numpy_generator():
+    """random_state=0 must not be treated as falsy and silently ignored (#314)."""
+    dimension = Categorical(["a", "b"], random_state=0)
+
+    assert dimension.rng is not None
+
+
+@pytest.mark.parametrize(
+    "choices, priors, random_state",
+    [
+        ([True, False], None, None),
+        ([True, False], None, 1),
+        ([1, 2, 3], None, None),
+        ([1, 2, 3], None, 1),
+        (["a", "b", "c"], [0.5, 0.3, 0.2], None),
+        (["a", "b", "c"], [0.5, 0.3, 0.2], 1),
+    ],
+)
+def test_categorical_sample_returns_native_python_types(choices, priors, random_state):
+    """sample() must return the exact stored object, not a numpy scalar (#324).
+
+    A seeded Categorical previously sampled via ``self.rng.choice(self.choices, ...)``,
+    which numpy coerces to one of its own scalar types (e.g. ``np.True_``,
+    ``np.int64``) -- unlike the unseeded ``random``-module path, which returns the
+    original Python object untouched. The return type should not depend on
+    whether a seed was given.
+    """
+    dimension = Categorical(choices, priors=priors, random_state=random_state)
+    expected_type = type(choices[0])
+
+    for _ in range(20):
+        value = dimension.sample()
+        assert value in choices
+        assert type(value) is expected_type, f"expected {expected_type}, got {type(value)}"
+
+
+@pytest.mark.parametrize(
+    "data_object, parameters",
+    [
+        (Integer, {"lower": 1, "upper": 1000}),
+        (Continuous, {"lower": 0.0, "upper": 1.0}),
+    ],
+)
+def test_integer_and_continuous_random_state_zero_uses_numpy_generator(data_object, parameters):
+    """random_state=0 must not be treated as falsy and silently ignored (#322)."""
+    dimension = data_object(random_state=0, **parameters)
+
+    assert dimension.rng is not None
+
+
+@pytest.mark.parametrize(
+    "data_object, parameters",
+    [
+        (Integer, {"lower": 1, "upper": 1000}),
+        (Continuous, {"lower": 0.0, "upper": 1.0}),
+    ],
+)
+def test_integer_and_continuous_random_state_zero_is_deterministic(data_object, parameters):
+    """Same random_state=0 yields the same sample sequence (#322)."""
+    first = data_object(random_state=0, **parameters)
+    second = data_object(random_state=0, **parameters)
+
+    seq_first = [first.sample() for _ in range(5)]
+    seq_second = [second.sample() for _ in range(5)]
+
+    assert seq_first == seq_second
+
+
+def test_space_classes_have_complete_type_annotations():
+    """random_state and sample() carry annotations on every space class (#209)."""
+    import inspect
+
+    for cls, sample_return in [(Integer, int), (Continuous, float), (Categorical, Any)]:
+        init_params = inspect.signature(cls.__init__).parameters
+        assert init_params["random_state"].annotation is not inspect.Parameter.empty
+        sample_sig = inspect.signature(cls.sample)
+        assert sample_sig.return_annotation is sample_return
+
+    # The abstract base also annotates its sample() return type.
+    assert inspect.signature(BaseDimension.sample).return_annotation is Any
+
+
 def test_check_space_fail():
     with pytest.raises(Exception) as excinfo:
         my_space = Space()
@@ -104,12 +266,87 @@ def test_check_space_fail():
         "max_depth": range(10, 20),
     }
 
-    with pytest.raises(Exception) as excinfo:
+    with pytest.raises(ValueError) as excinfo:
         my_space = Space(param_grid)
-    assert (
-        str(excinfo.value)
-        == "max_depth must be a valid instance of Integer, Categorical or Continuous classes"
+    message = str(excinfo.value)
+    # The improved message names the offending key, the type that was passed,
+    # and shows a corrective example.
+    assert "Invalid param_grid entry for 'max_depth'" in message
+    assert "got range instead" in message
+    assert "Categorical" in message
+
+
+def test_check_space_invalid_type_message():
+    """A non-space value yields a clear, actionable error (issue #210)."""
+    param_grid = {"kernel": ["rbf", "linear"]}  # should be Categorical([...])
+
+    with pytest.raises(ValueError, match=r"Invalid param_grid entry for 'kernel'"):
+        Space(param_grid)
+
+    with pytest.raises(ValueError) as excinfo:
+        Space(param_grid)
+    message = str(excinfo.value)
+    assert "expected a space object (Continuous, Integer, or Categorical)" in message
+    assert "got list instead" in message
+    assert 'param_grid = {"kernel": Categorical([...])}' in message
+
+
+def _warm_start_space():
+    return Space(
+        {
+            "max_depth": Integer(2, 20),
+            "criterion": Categorical(["gini", "entropy"]),
+        }
     )
+
+
+def test_sample_warm_start_accepts_valid_config():
+    space = _warm_start_space()
+    sampled = space.sample_warm_start({"max_depth": 5, "criterion": "gini"})
+    assert sampled["max_depth"] == 5
+    assert sampled["criterion"] == "gini"
+
+
+def test_sample_warm_start_rejects_unknown_key():
+    """A misspelled hyperparameter name is reported clearly (issue #220)."""
+    space = _warm_start_space()
+    with pytest.raises(ValueError) as excinfo:
+        space.sample_warm_start({"max_depths": 5})  # typo: should be max_depth
+    message = str(excinfo.value)
+    assert "max_depths" in message
+    assert "not in the search space" in message
+    assert "max_depth" in message  # the valid name is suggested
+
+
+def test_sample_warm_start_rejects_non_dict_config():
+    space = _warm_start_space()
+    with pytest.raises(ValueError, match="must be a dict"):
+        space.sample_warm_start([("max_depth", 5)])
+
+
+def test_sample_warm_start_rejects_value_outside_space():
+    """A value outside its dimension is reported clearly (issue #220)."""
+    space = _warm_start_space()  # max_depth Integer(2, 20), criterion gini/entropy
+    with pytest.raises(ValueError, match="outside its search space"):
+        space.sample_warm_start({"max_depth": 999})
+    with pytest.raises(ValueError, match="outside its search space"):
+        space.sample_warm_start({"criterion": "log_loss"})
+
+
+def test_sample_warm_start_allows_missing_keys():
+    """Missing keys are intentionally allowed and filled by sampling."""
+    space = _warm_start_space()
+    sampled = space.sample_warm_start({"max_depth": 5})  # criterion omitted
+    assert sampled["max_depth"] == 5
+    assert sampled["criterion"] in ["gini", "entropy"]
+
+
+def test_sample_warm_start_accepts_numpy_scalars():
+    """NumPy scalars are valid values, not rejected as out-of-space (#220)."""
+    space = Space({"max_depth": Integer(2, 20), "lr": Continuous(0.0, 1.0)})
+    sampled = space.sample_warm_start({"max_depth": np.int64(5), "lr": np.float64(0.5)})
+    assert sampled["max_depth"] == 5
+    assert sampled["lr"] == 0.5
 
 
 @pytest.mark.parametrize(
@@ -129,10 +366,6 @@ def test_bad_data_types(data_object, parameters, message):
 
 
 def test_wrong_dimension():
-    possible_messages = [
-        "Can't instantiate abstract class FakeDimension with abstract methods sample",
-        "Can't instantiate abstract class FakeDimension with abstract method sample",
-    ]
     with pytest.raises(Exception) as excinfo:
 
         class FakeDimension(BaseDimension):
@@ -141,4 +374,101 @@ def test_wrong_dimension():
 
         FakeDimension().sample()
 
-    assert any([str(excinfo.value) == i for i in possible_messages])
+    message = str(excinfo.value)
+    assert "Can't instantiate abstract class FakeDimension" in message
+    assert "sample" in message
+
+
+def test_from_sklearn_space_converts_lists_and_scipy_distributions():
+    native_dimension = Integer(1, 3)
+    converted = from_sklearn_space(
+        {
+            "criterion": ["gini", "entropy"],
+            "max_depth": stats.randint(2, 12),
+            "learning_rate": stats.uniform(0.01, 0.29),
+            "alpha": stats.loguniform(1e-5, 1e-1),
+            "already_native": native_dimension,
+        }
+    )
+
+    assert isinstance(converted["criterion"], Categorical)
+    assert converted["criterion"].choices == ["gini", "entropy"]
+    assert isinstance(converted["max_depth"], Integer)
+    assert converted["max_depth"].lower == 2
+    assert converted["max_depth"].upper == 11
+    assert isinstance(converted["learning_rate"], Continuous)
+    assert converted["learning_rate"].lower == pytest.approx(0.01)
+    assert converted["learning_rate"].upper == pytest.approx(0.3)
+    assert converted["learning_rate"].distribution == "uniform"
+    assert isinstance(converted["alpha"], Continuous)
+    assert converted["alpha"].distribution == "log-uniform"
+    assert converted["already_native"].lower == 1
+    assert converted["already_native"] is native_dimension
+
+
+def test_from_sklearn_space_converts_keyword_scipy_distributions():
+    converted = from_sklearn_space(
+        {
+            "max_depth": stats.randint(low=3, high=9),
+            "subsample": stats.uniform(loc=0.25, scale=0.5),
+            "reg_alpha": stats.reciprocal(a=1e-6, b=1e-2),
+        }
+    )
+
+    assert converted["max_depth"].lower == 3
+    assert converted["max_depth"].upper == 8
+    assert converted["subsample"].lower == pytest.approx(0.25)
+    assert converted["subsample"].upper == pytest.approx(0.75)
+    assert converted["reg_alpha"].lower == pytest.approx(1e-6)
+    assert converted["reg_alpha"].upper == pytest.approx(1e-2)
+    assert converted["reg_alpha"].distribution == "log-uniform"
+
+
+def test_from_sklearn_space_converts_range_and_numpy_array_to_categorical():
+    converted = from_sklearn_space(
+        {
+            "depth_options": range(2, 5),
+            "activation": ["relu", "tanh"],
+            "batch_size": np.array([32, 64, 128]),
+        }
+    )
+
+    assert converted["depth_options"].choices == [2, 3, 4]
+    assert converted["activation"].choices == ["relu", "tanh"]
+    assert converted["batch_size"].choices == [32, 64, 128]
+
+
+def test_from_sklearn_space_rejects_unsupported_distributions():
+    with pytest.raises(ValueError) as excinfo:
+        from_sklearn_space({"alpha": stats.expon()})
+
+    message = str(excinfo.value)
+    assert "alpha uses scipy.stats.expon" in message
+    assert (
+        "Supported scipy distributions are randint, uniform, loguniform, and reciprocal" in message
+    )
+    assert "define the search space manually" in message
+    assert "Continuous(lower, upper)" in message
+    # Guidance for users who actually wanted a small set of choices (#260).
+    assert "Categorical([...])" in message
+    assert "choices" in message
+
+
+def test_from_sklearn_space_rejects_empty_or_ambiguous_values():
+    with pytest.raises(ValueError, match="non-empty mapping"):
+        from_sklearn_space({})
+
+    with pytest.raises(ValueError, match="has no categorical choices"):
+        from_sklearn_space({"criterion": []})
+
+    with pytest.raises(ValueError, match="must be a list-like value"):
+        from_sklearn_space({"max_depth": 3})
+
+
+def test_from_sklearn_space_rejects_broken_frozen_distribution_bounds(monkeypatch):
+    broken_distribution = stats.randint(1, 5)
+    monkeypatch.setattr(broken_distribution, "args", ())
+    monkeypatch.setattr(broken_distribution, "kwds", {})
+
+    with pytest.raises(ValueError, match="must define low and high bounds"):
+        from_sklearn_space({"max_depth": broken_distribution})

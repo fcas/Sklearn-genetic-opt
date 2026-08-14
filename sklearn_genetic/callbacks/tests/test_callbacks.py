@@ -2,6 +2,7 @@ import pytest
 import os
 import shutil
 import logging
+import importlib.util
 
 from deap.tools import Logbook
 from sklearn.tree import DecisionTreeClassifier
@@ -21,6 +22,8 @@ from .. import (
 )
 from ..validations import check_stats, check_callback, eval_callbacks
 from ..base import BaseCallback
+
+tensorflow_available = importlib.util.find_spec("tensorflow") is not None
 
 data = load_digits()
 label_names = data["target_names"]
@@ -42,8 +45,8 @@ def test_check_metrics_and_methods():
     with pytest.raises(Exception) as excinfo:
         check_stats("accuracy")
     assert (
-        str(excinfo.value)
-        == "metric must be one of ['fitness', 'fitness_std', 'fitness_max', 'fitness_min'], "
+        str(excinfo.value) == "metric must be one of "
+        "['fitness', 'fitness_std', 'fitness_best', 'fitness_max', 'fitness_min'], "
         "but got accuracy instead"
     )
 
@@ -119,6 +122,12 @@ def test_threshold_callback():
     assert str(excinfo.value) == "At least one of record or logbook parameters must be provided"
 
 
+@pytest.mark.parametrize("threshold", ["0.8", None, object()])
+def test_threshold_callback_rejects_non_numeric_threshold(threshold):
+    with pytest.raises((TypeError, ValueError), match="threshold"):
+        ThresholdStopping(threshold=threshold)
+
+
 def test_consecutive_callback():
     callback = ConsecutiveStopping(generations=3)
     assert check_callback(callback) == [callback]
@@ -147,6 +156,18 @@ def test_consecutive_callback():
     with pytest.raises(Exception) as excinfo:
         callback()
     assert str(excinfo.value) == "logbook parameter must be provided"
+
+
+@pytest.mark.parametrize("generations", ["3", None, object()])
+def test_consecutive_callback_rejects_non_numeric_generations(generations):
+    with pytest.raises((TypeError, ValueError), match="generations"):
+        ConsecutiveStopping(generations=generations)
+
+
+@pytest.mark.parametrize("generations", [0, -1])
+def test_consecutive_callback_rejects_non_positive_generations(generations):
+    with pytest.raises((TypeError, ValueError), match="generations"):
+        ConsecutiveStopping(generations=generations)
 
 
 def test_delta_callback():
@@ -178,6 +199,42 @@ def test_delta_callback():
     with pytest.raises(Exception) as excinfo:
         callback()
     assert str(excinfo.value) == "logbook parameter must be provided"
+
+
+@pytest.mark.parametrize("threshold", ["0.001", None, object()])
+def test_delta_callback_rejects_non_numeric_threshold(threshold):
+    with pytest.raises((TypeError, ValueError), match="threshold"):
+        DeltaThreshold(threshold=threshold)
+
+
+@pytest.mark.parametrize("generations", ["2", None, object()])
+def test_delta_callback_rejects_non_numeric_generations(generations):
+    with pytest.raises((TypeError, ValueError), match="generations"):
+        DeltaThreshold(threshold=0.001, generations=generations)
+
+
+@pytest.mark.parametrize("generations", [0, -1])
+def test_delta_callback_rejects_non_positive_generations(generations):
+    with pytest.raises((TypeError, ValueError), match="generations"):
+        DeltaThreshold(threshold=0.001, generations=generations)
+
+
+def test_timer_callback_accepts_numeric_total_seconds():
+    callback = TimerStopping(total_seconds=0.1)
+
+    assert callback.total_seconds == 0.1
+
+
+@pytest.mark.parametrize("total_seconds", ["10", None, object()])
+def test_timer_callback_rejects_non_numeric_total_seconds(total_seconds):
+    with pytest.raises((TypeError, ValueError), match="total_seconds"):
+        TimerStopping(total_seconds=total_seconds)
+
+
+@pytest.mark.parametrize("total_seconds", [0, -1])
+def test_timer_callback_rejects_non_positive_total_seconds(total_seconds):
+    with pytest.raises((TypeError, ValueError), match="total_seconds"):
+        TimerStopping(total_seconds=total_seconds)
 
 
 def test_logbook_saver_callback(caplog):
@@ -218,6 +275,10 @@ def test_logbook_saver_callback(caplog):
         (TensorBoard(log_dir="./logs", run_id="0"), "./logs/0"),
         (TensorBoard(log_dir="./logs", run_id="1"), "./logs/1"),
     ],
+)
+@pytest.mark.skipif(
+    not tensorflow_available,
+    reason="TensorFlow is not available for this Python version",
 )
 def test_tensorboard_callback(callback, path):
     assert check_callback(callback) == [callback]
